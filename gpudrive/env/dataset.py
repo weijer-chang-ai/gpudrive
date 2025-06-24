@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Iterator, List
+from typing import Iterator, List, Optional, Dict, Any, Union
 import os
 import random
 
@@ -62,6 +62,10 @@ class SceneDataLoader:
         # Initialize state for iteration
         self._reset_indices()
 
+    def __getitem__(self, idx):
+        """Get file path by index - original behavior preserved."""
+        return self.dataset[idx]
+
     def _reset_indices(self):
         """Reset indices for sampling."""
         if self.sample_with_replacement:
@@ -113,12 +117,26 @@ class SceneDataLoader:
         return batch
 
 
+def infer_split(path: str) -> str:
+    """Infer split from the last directory component of the path."""
+    last_dir = os.path.basename(path.rstrip('/'))
+    
+    mapping = {
+        'training': 'training', 'validation': 'validation', 
+        'testing': 'testing'
+    }
+    
+    if last_dir in mapping:
+        return mapping[last_dir]
+    else:
+        raise ValueError(f"Cannot infer split from directory name: '{last_dir}'. Expected one of: {list(mapping.keys())}")
+
 # Example usage
 if __name__ == "__main__":
     from pprint import pprint
 
     data_loader = SceneDataLoader(
-        root="data/processed/training",
+        root="/workspace/data/gpu_drive/validation",
         batch_size=5,
         dataset_size=15,
         sample_with_replacement=True,  # Sampling with replacement
@@ -137,7 +155,7 @@ if __name__ == "__main__":
 
     # Now without replacement
     data_loader = SceneDataLoader(
-        root="data/processed/training",
+        root="/workspace/data/gpu_drive/validation",
         batch_size=5,
         dataset_size=15,
         sample_with_replacement=False,  # Sampling with replacement
@@ -151,3 +169,43 @@ if __name__ == "__main__":
 
         unique_files_sampled.update(batch)
         coverage = len(unique_files_sampled) / len(data_loader.dataset) * 100
+    # from pprint import pprint
+
+    # # Original behavior - unchanged
+    # data_loader = SceneDataLoader(
+    #     root="/workspace/data/gpu_drive/validation",
+    #     batch_size=5,
+    #     dataset_size=15,
+    #     sample_with_replacement=True,
+    #     shuffle=False,
+    # )
+
+    # print("Original behavior:")
+    # for idx, batch in enumerate(data_loader):
+    #     print(f"Batch {idx} (paths): {[os.path.basename(path) for path in batch]}")
+    #     # __getitem__ returns path
+    #     path = data_loader[0]
+    #     print(f"data_loader[0]: {os.path.basename(path)}")
+    #     if idx > 0:
+    #         break
+
+    # # New behavior - loads data via __getitem__
+    # loaded_data_loader = LoadedSceneDataLoader(
+    #     root="/workspace/data/gpu_drive/validation",
+    #     batch_size=2,
+    #     dataset_size=5,
+    #     pkl_root="/workspace/data/processed/pkl_data"
+    # )
+
+    # print("\nNew behavior:")
+    # for idx, batch in enumerate(loaded_data_loader):
+    #     print(f"Batch {idx} (paths): {[os.path.basename(path) for path in batch]}")
+        
+    #     # __getitem__ loads the data
+    #     scene_data = loaded_data_loader[0]
+    #     scenario_id = scene_data.get('traffic_scene', {}).get('scenario_id', 'N/A')
+    #     has_pkl = scene_data.get('pkl_data') is not None
+    #     print(f"loaded_data_loader[0]: scenario_id={scenario_id}, pkl={has_pkl}")
+        
+    #     if idx > 0:
+    #         break

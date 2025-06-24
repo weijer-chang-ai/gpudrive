@@ -6,6 +6,8 @@ import torch
 from itertools import product
 import mediapy as media
 import gymnasium
+import os
+import pickle
 
 from gpudrive.datatypes.observation import (
     LocalEgoState,
@@ -28,7 +30,7 @@ from gpudrive.datatypes.info import Info
 
 from gpudrive.visualize.core import MatplotlibVisualizer
 from gpudrive.visualize.utils import img_from_fig
-from gpudrive.env.dataset import SceneDataLoader
+from gpudrive.env.dataset import SceneDataLoader, infer_split
 from gpudrive.utils.geometry import normalize_min_max
 
 from gpudrive.integrations.vbd.data_utils import process_scenario_data
@@ -46,6 +48,8 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         action_type="discrete",
         render_config: RenderConfig = RenderConfig(),
         backend="torch",
+        smart_pkl_root=None,      # Path to directory containing .pkl files
+        use_smart_reward=False,   # Enable SMART-specific reward functionality
     ):
         # Initialization of environment configurations
         self.config = config
@@ -59,6 +63,15 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         self.world_time_steps = torch.zeros(
             self.num_worlds, dtype=torch.short, device=self.device
         )
+
+        # SMART data handling setup
+        if smart_pkl_root is not None:
+            self.smart_pkl_root = os.path.join(smart_pkl_root, infer_split(data_loader.root))
+        else:
+            self.smart_pkl_root = None
+        self.use_smart_reward = use_smart_reward
+        self.is_smart_data = bool(smart_pkl_root)  # Simple: if pkl_root provided, it's SMART data
+        self.smart_pkl_data = []  # List to store pickle data for current batch
 
         # Initialize reward weights tensor if using reward_conditioned
         self.reward_weights_tensor = None
@@ -85,6 +98,9 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         # Initialize simulator
         self.sim = self._initialize_simulator(params, self.data_batch)
 
+        #obtain the SMART format
+        if self.is_smart_data:
+            self._load_smart_pickle_data_for_batch(self.data_batch)
         # Controlled agents setup
         self.cont_agent_mask = self.get_controlled_agents_mask()
         self.max_agent_count = self.cont_agent_mask.shape[1]
@@ -127,6 +143,61 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
             env_config=self.config,
         )
 
+    def _load_smart_pickle_data_for_batch(self, data_batch):
+        """Load *.pkl files into a list for the current batch."""
+        if not self.is_smart_data or not self.smart_pkl_root:
+            self.smart_pkl_data = []
+            return
+
+        # Get scenario IDs for this batch
+        scenario_ids = self.get_scenario_ids().values()
+        
+        # Load pickle data into list
+        self.smart_pkl_data = []
+        loaded_count = 0
+        
+        for sid in scenario_ids:
+            if sid is None:
+                self.smart_pkl_data.append(None)
+                continue
+                
+            # Construct path directly
+            pkl_path = os.path.join(self.smart_pkl_root, f"{sid}.pkl")
+            
+            if os.path.exists(pkl_path):
+                try:
+                    with open(pkl_path, "rb") as f:
+                        pickle_data = pickle.load(f)
+                    self.smart_pkl_data.append(pickle_data)
+                    loaded_count += 1
+                except Exception as e:
+                    print(f"⚠ Failed to load pickle for {sid}: {e}")
+                    self.smart_pkl_data.append(None)
+            else:
+                print(f"⚠ Pickle file not found: {pkl_path}")
+                self.smart_pkl_data.append(None)
+                
+        if loaded_count > 0:
+            print(f"✓ Loaded {loaded_count} pickle files for current batch")
+
+    def get_smart_rewards(self, **kwargs):
+        """Get SMART-specific rewards if enabled."""
+        if not self.use_smart_reward:
+            return self.get_rewards(**kwargs)  # Fall back to standard rewards
+            
+        # Implement SMART-specific reward logic here
+        # This could use the pickle data for more sophisticated reward calculation
+        scenario_ids = self.get_scenario_ids()
+        pickle_data_batch = self.get_scenario_pickle_data_batch()
+        
+        # Example: modify rewards based on pickle data
+        base_rewards = self.get_rewards(**kwargs)
+        
+        # Add SMART-specific reward modifications here
+        # For example, using expert trajectories from pickle data
+        
+        return base_rewards
+
     def _initialize_vbd(self):
         """
         Initialize the Versatile Behavior Diffusion (VBD) model and related
@@ -135,7 +206,7 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         Args:
             config: Configuration object containing VBD settings.
         """
-        self.use_vbd = self.config.use_vbd
+        self.use_vbd = self.config.self.device
         self.vbd_trajectory_weight = self.config.vbd_trajectory_weight
 
         # Set initialization steps - ensure minimum steps for VBD
@@ -1278,7 +1349,7 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
     def swap_data_batch(self, data_batch=None):
         """
         Swap the current data batch in the simulator with a new one
-        and reinitialize dependent attributes.
+        and reinitialize dependent attributes. Now handles SMART pickle data.
         """
 
         if data_batch is None:  # Sample new data batch from the data loader
@@ -1293,6 +1364,8 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
                 f"the expected number of worlds ({self.num_worlds})."
             )
 
+       
+
         # Update the simulator with the new data
         self.sim.set_maps(self.data_batch)
 
@@ -1306,68 +1379,19 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         # Generate VBD trajectories for the new batch if VBD is enabled
         if self.use_vbd and self.vbd_model is not None:
             self._generate_vbd_trajectories()
+         # Load SMART pickle data for new batch if needed
+        if self.is_smart_data:
+            self._load_smart_pickle_data_for_batch(self.data_batch)
 
         # Reset static scenario data for the visualizer
         self.vis.initialize_static_scenario_data(self.cont_agent_mask)
 
-    def _generate_vbd_trajectories(self):
-        """Generate and store trajectory predictions for all scenes using VBD model."""
-        if not self.use_vbd or self.vbd_model is None:
-            return
-
-        _ = self.reset()
-
-        # Generate sample batch using the limited mask
-        sample_batch = self._generate_sample_batch(init_steps=self.init_steps)
-
-        # VBD model prediction
-        predictions = self.vbd_model.sample_denoiser(sample_batch)
-        vbd_trajectories = (
-            predictions["denoised_trajs"].to(self.device).numpy()
-        )
-        agent_indices = sample_batch["agents_id"]
-
-        self.vbd_trajectories.zero_()
-        # Process each world separately
-        for world_idx in range(self.num_worlds):
-            world_agent_indices = agent_indices[world_idx]
-
-            # Filter out negative indices (they're our padding)
-            valid_mask = (
-                world_agent_indices >= 0
-            )  # Boolean mask of valid indices
-            valid_agent_indices = world_agent_indices[
-                valid_mask
-            ]  # Filtered tensor
-
-            if len(valid_agent_indices) > 0:
-                # Update vbd_trajectories(x, y, yaw, vel_x, vel_y) for this world's agents
-                self.vbd_trajectories[
-                    world_idx, valid_agent_indices, :, :2
-                ] = torch.Tensor(
-                    vbd_trajectories[
-                        world_idx, : len(valid_agent_indices), :, :2
-                    ]
-                )
-                self.vbd_trajectories[
-                    world_idx, valid_agent_indices, :, :2
-                ] -= self.sim.world_means_tensor().to_torch()[
-                    world_idx, :2
-                ]  # subtract mean
-                self.vbd_trajectories[
-                    world_idx, valid_agent_indices, :, 2
-                ] = torch.Tensor(
-                    vbd_trajectories[
-                        world_idx, : len(valid_agent_indices), :, 2
-                    ]
-                )
-                self.vbd_trajectories[
-                    world_idx, valid_agent_indices, :, 3:
-                ] = torch.Tensor(
-                    vbd_trajectories[
-                        world_idx, : len(valid_agent_indices), :, 3:5
-                    ]
-                )
+    def get_scenario_pickle_data_batch(self):
+        """Get pickle data for all scenarios in current batch."""
+        if not self.is_smart_data:
+            return [None] * self.num_worlds
+            
+        return self.smart_pkl_data.copy()  # Return a copy of the list
 
     def get_expert_actions(self):
         """Get expert actions for the full trajectories across worlds.

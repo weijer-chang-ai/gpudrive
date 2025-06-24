@@ -143,6 +143,11 @@ class EnvConfig:
     vbd_model_path: str = None
     vbd_trajectory_weight: float = 0.01
     vbd_in_obs: bool = False
+    #smart settings
+    smart_pkl_root: str = None
+    use_smart_reward: bool = False
+    smart_model_path: str = None
+    
 
 
 class SelectionDiscipline(Enum):

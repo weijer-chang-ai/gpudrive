@@ -261,3 +261,7 @@ output_videos_small_dataset/
 models/
 
 # End of https://www.toptal.com/developers/gitignore/api/python,c++
+
+
+/gpudrive_cache
+=*
