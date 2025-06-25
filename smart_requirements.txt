@@ -1,6 +1,6 @@
 # torch and lightning for training
-torch==2.4.1 # BSD-style License: https://github.com/pytorch/pytorch/blob/main/LICENSE
-torchvision==0.19.1 # BSD 3-Clause License: https://github.com/pytorch/vision/blob/main/LICENSE
+torch==2.6.0 # BSD-style License: https://github.com/pytorch/pytorch/blob/main/LICENSE
+torchvision==0.21.0 # BSD 3-Clause License: https://github.com/pytorch/vision/blob/main/LICENSE
 lightning==2.4.0 # Apache License 2.0: https://github.com/Lightning-AI/pytorch-lightning/blob/master/LICENSE
 torchmetrics==1.4.1 # Apache License 2.0: https://github.com/Lightning-AI/torchmetrics/blob/master/LICENSE
 pandas==2.2.2 # BSD 3-Clause License: https://github.com/pandas-dev/pandas/blob/main/LICENSE
