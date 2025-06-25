@@ -3,6 +3,8 @@ FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 ENV PATH="/workspace/home/.local/bin:$PATH"
+USER ${USERNAME}
+RUN echo "USER: ${USERNAME}"
 
 # Install basic dependencies
 RUN apt-get update && apt-get install -y \
@@ -29,6 +31,7 @@ ENV PATH /opt/conda/bin:$PATH
 # Create conda environment with Python 3.11
 RUN conda create -y -n gpudrive python=3.11 && \
     echo "source activate gpudrive" > ~/.bashrc
+RUN chown -R ${USERNAME}:${USERNAME} /opt/conda/envs/gpudrive
 ENV PATH /opt/conda/envs/gpudrive/bin:$PATH
 ENV CONDA_DEFAULT_ENV gpudrive
 ENV CONDA_PREFIX /opt/conda/envs/gpudrive
@@ -44,6 +47,10 @@ WORKDIR /workspace/gpudrive
 # Create a directory for copied code
 RUN mkdir -p /workspace/code
 WORKDIR /workspace
+
+# Copy SMART requirements file
+COPY smart_requirements.txt /workspace/smart_requirements.txt
+
 ENV DEBIAN_FRONTEND=dialog
 # Create an entrypoint script that builds and installs GPUDrive from the mounted source
 RUN echo '#!/bin/bash\n\
@@ -68,7 +75,15 @@ RUN echo '#!/bin/bash\n\
     # Install GPUDrive and dependencies\n\
     echo "Installing GPUDrive..."\n\
     /opt/conda/envs/gpudrive/bin/pip install --no-cache-dir -e .\n\
-    /opt/conda/envs/gpudrive/bin/pip install --no-cache-dir pufferlib>=2.0.6 torch==2.6.0 nvidia-cuda-runtime-cu12==12.4.127 jupyter>=1.1.1 jupyterhub>=5.3.0 '\''numpy<2.0'\''\n\
+    /opt/conda/envs/gpudrive/bin/pip install --no-cache-dir pufferlib>=2.0.6 nvidia-cuda-runtime-cu12==12.4.127 jupyter>=1.1.1 jupyterhub>=5.3.0 '\''numpy<2.0'\''\n\
+    \n\
+    # Install SMART dependencies\n\
+    echo "Installing SMART dependencies..."\n\
+    # /opt/conda/bin/conda install -y -c conda-forge ffmpeg=4.3.2\n\
+    /opt/conda/envs/gpudrive/bin/pip install --no-cache-dir -r /workspace/smart_requirements.txt\n\
+    /opt/conda/envs/gpudrive/bin/pip install --no-cache-dir torch_geometric\n\
+    /opt/conda/envs/gpudrive/bin/pip install --no-cache-dir pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.6.0+cu124.html\n\
+    # /opt/conda/envs/gpudrive/bin/pip install --no-cache-dir --no-deps waymo-open-dataset-tf-2-12-0==1.6.4\n\
     \n\
     # Install JAX and Wandb\n\
     echo "Installing JAX and Wandb..."\n\
