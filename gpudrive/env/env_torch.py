@@ -34,7 +34,28 @@ from gpudrive.env.dataset import SceneDataLoader, infer_split
 from gpudrive.utils.geometry import normalize_min_max
 
 from gpudrive.integrations.vbd.data_utils import process_scenario_data
+from torch_geometric.data import HeteroData,Batch as GeoBatch
+from gpudrive.integrations.smart.tokens import TokenProcessor
+from gpudrive.integrations.smart.datamodules.target_builder import (
+    WaymoTargetBuilderTrain, WaymoTargetBuilderVal,
+)
 
+# utils.smart_loader.py  (new small helper)
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
+import torch
+from omegaconf import DictConfig
+
+def load_smart(model_cfg: DictConfig, device="cuda"):
+    """Load SMART model from checkpoint using Lightning's load_from_checkpoint."""
+    from gpudrive.integrations.smart.model.smart import SMART
+    
+    model = SMART.load_from_checkpoint(
+        model_cfg.model_ckpt, 
+        map_location=torch.device(device),
+        strict=False
+    )
+    return model.eval()
 
 class GPUDriveTorchEnv(GPUDriveGymEnv):
     """Torch Gym Environment that interfaces with the GPU Drive simulator."""
@@ -50,6 +71,7 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         backend="torch",
         smart_pkl_root=None,      # Path to directory containing .pkl files
         use_smart_reward=False,   # Enable SMART-specific reward functionality
+        smart_cfg=None,           # +++ add: OmegaConf or dict with file paths & sampling args
     ):
         # Initialization of environment configurations
         self.config = config
@@ -72,6 +94,7 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         self.use_smart_reward = use_smart_reward
         self.is_smart_data = bool(smart_pkl_root)  # Simple: if pkl_root provided, it's SMART data
         self.smart_pkl_data = []  # List to store pickle data for current batch
+        self.smart_cfg = smart_cfg        # +++ add this line
 
         # Initialize reward weights tensor if using reward_conditioned
         self.reward_weights_tensor = None
@@ -143,6 +166,9 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
             env_config=self.config,
         )
 
+        # Initialize SMART model and preprocessing pipeline
+        self._initialize_smart()
+
     def _load_smart_pickle_data_for_batch(self, data_batch):
         """Load *.pkl files into a list for the current batch."""
         if not self.is_smart_data or not self.smart_pkl_root:
@@ -179,24 +205,65 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
                 
         if loaded_count > 0:
             print(f"✓ Loaded {loaded_count} pickle files for current batch")
-
+    
     def get_smart_rewards(self, **kwargs):
-        """Get SMART-specific rewards if enabled."""
-        if not self.use_smart_reward:
+        """Get SMART-specific rewards using the preprocessing pipeline."""
+        if not self.use_smart_reward or self.smart_model is None:
             return self.get_rewards(**kwargs)  # Fall back to standard rewards
+
+        # 1. base env reward
+        base_r = self.get_rewards(**kwargs)
+
+        try:
+            # 2. run SMART on current timestep once every call
+            batch_hetero = self._smart_hetero_batch()
             
-        # Implement SMART-specific reward logic here
-        # This could use the pickle data for more sophisticated reward calculation
-        scenario_ids = self.get_scenario_ids()
-        pickle_data_batch = self.get_scenario_pickle_data_batch()
+            if batch_hetero is None:
+                # No SMART data available, return base rewards
+                return base_r
+            
+            smart_scores = self.smart_model(batch_hetero)  # (N_agents,) or (B, A)
+            
+            # Reshape smart_scores to match base_r shape: (num_worlds, max_agent_count)
+            if smart_scores.dim() == 1:
+                # If flat tensor, reshape to batch format
+                # This assumes smart_scores are ordered by world then agent
+                smart_scores = smart_scores.view(self.num_worlds, -1)
+            
+            # Ensure smart_scores matches base_r shape
+            if smart_scores.shape != base_r.shape:
+                # Pad or truncate to match base reward shape
+                target_shape = base_r.shape
+                if smart_scores.shape[1] < target_shape[1]:
+                    # Pad with zeros if fewer agents
+                    padding = torch.zeros(
+                        (target_shape[0], target_shape[1] - smart_scores.shape[1]),
+                        device=self.device
+                    )
+                    smart_scores = torch.cat([smart_scores, padding], dim=1)
+                elif smart_scores.shape[1] > target_shape[1]:
+                    # Truncate if more agents
+                    smart_scores = smart_scores[:, :target_shape[1]]
+
+            # 3. fuse (simple weighted sum here – tune as needed)
+            alpha = getattr(self.smart_cfg, 'weight', 0.1)  # Default weight
+            return base_r + alpha * smart_scores
         
-        # Example: modify rewards based on pickle data
-        base_rewards = self.get_rewards(**kwargs)
+        except Exception as e:
+            print(f"Warning: SMART reward computation failed: {e}")
+            # Fall back to base rewards on any error
+            return base_r
+
+    def _load_smart_model(self, model_path):
+        """Load the SMART model from checkpoint."""
+        from gpudrive.integrations.smart.model import SMART
         
-        # Add SMART-specific reward modifications here
-        # For example, using expert trajectories from pickle data
-        
-        return base_rewards
+        model = SMART.load_from_checkpoint(
+            model_path, 
+            map_location=torch.device(self.device)
+        )
+        model = model.eval()
+        return model
 
     def _initialize_vbd(self):
         """
@@ -206,7 +273,7 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         Args:
             config: Configuration object containing VBD settings.
         """
-        self.use_vbd = self.config.self.device
+        self.use_vbd = self.config.use_vbd
         self.vbd_trajectory_weight = self.config.vbd_trajectory_weight
 
         # Set initialization steps - ensure minimum steps for VBD
@@ -1382,6 +1449,12 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
          # Load SMART pickle data for new batch if needed
         if self.is_smart_data:
             self._load_smart_pickle_data_for_batch(self.data_batch)
+            # +++ add: warm-up cache for SMART preprocessing
+            if self.use_smart_reward:
+                try:
+                    self._smart_hetero_batch()  # warm-up cache
+                except Exception as e:
+                    print(f"Warning: SMART preprocessing warm-up failed: {e}")
 
         # Reset static scenario data for the visualizer
         self.vis.initialize_static_scenario_data(self.cont_agent_mask)
@@ -1486,6 +1559,48 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
 
         return scenario_ids
 
+    def _initialize_smart(self):
+        if not self.use_smart_reward:
+            self.smart_model      = None
+            self.smart_transform  = None
+            return
+
+        # 1.  PyG transform that builds masks / train-val logic
+        if self.smart_cfg.split == "train":
+            self.smart_transform = WaymoTargetBuilderTrain(
+                max_num=self.smart_cfg.max_train_agents
+            )
+        else:
+            self.smart_transform = WaymoTargetBuilderVal()
+
+        # 2.  The actual model (Hydra-instantiated; has own TokenProcessor)
+        self.smart_model = load_smart(
+            model_cfg = self.smart_cfg,
+            device   = self.device,
+        )
+
+
+    @torch.no_grad()
+    def _smart_hetero_batch(self) -> GeoBatch | None:
+        """Takes the pickle blobs you already loaded and returns a PyG batch.
+
+        SMART expects the *raw* Waymo-format dict; its TokenProcessor runs inside
+        the model's `forward`/`training_step`, so we only have to (1) wrap the dict
+        in `HeteroData`, (2) run WaymoTargetBuilder*, (3) batch.
+        """
+        if not (self.use_smart_reward and self.smart_pkl_data):
+            return None
+
+        hetero_list = []
+        for d in self.smart_pkl_data:          # one per world
+            if d is None:
+                continue                       # missing scenario → skip
+            g = self.smart_transform(d)        # add masks / train_mask
+            hetero_list.append(g)
+
+        if not hetero_list:
+            return None
+        return GeoBatch.from_data_list(hetero_list).to(self.device)
 
 if __name__ == "__main__":
 
@@ -1496,7 +1611,7 @@ if __name__ == "__main__":
 
     # Create data loader
     train_loader = SceneDataLoader(
-        root="data/processed/examples",
+        root="/workspace/data/gpu_drive/validation",
         batch_size=2,
         dataset_size=100,
         sample_with_replacement=True,
@@ -1509,6 +1624,18 @@ if __name__ == "__main__":
         data_loader=train_loader,
         max_cont_agents=64,  # Number of agents to control
         device="cpu",
+        smart_pkl_root="/workspace/data/smart",
+        use_smart_reward=True,
+        smart_cfg={
+            'model_ckpt': '/workspace/gpudrive/models/smart/clsft_E9.ckpt',
+            'map_token_file': 'gpudrive/integrations/smart/tokens/map_vocab_555_s2.pkl',
+            'agent_token_file': 'gpudrive/integrations/smart/tokens/agent_vocab_555_s2.pkl',
+            'map_sampling': 512,      # number of map tokens to sample
+            'agent_sampling': 128,    # number of agent tokens to sample
+            'weight': 0.1,           # weight for SMART rewards
+            'split': 'train',        # or 'val'
+            'max_train_agents': 32,  # for train split
+        }
     )
 
     control_mask = env.cont_agent_mask
@@ -1552,7 +1679,7 @@ if __name__ == "__main__":
         agent_obs_frames.append(img_from_fig(agent_obs))
 
         obs = env.get_obs()
-        reward = env.get_rewards()
+        reward = env.get_smart_rewards()
         done = env.get_dones()
         info = env.get_infos()
 
