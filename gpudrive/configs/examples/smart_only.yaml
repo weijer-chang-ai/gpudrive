@@ -1,0 +1,9 @@
+# @package _global_
+# Example: Enable SMART integration only
+defaults:
+  - ../base_config
+  - ../integrations/smart: smart
+  
+# Override any settings specific to SMART training
+env:
+  reward_type: "weighted_combination"  # Better for SMART rewards 

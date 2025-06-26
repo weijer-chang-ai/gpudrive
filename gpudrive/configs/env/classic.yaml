@@ -1,0 +1,78 @@
+# @package env
+_target_: gpudrive.env.config.EnvConfig
+
+# Observation space settings
+ego_state: true
+road_map_obs: true
+partner_obs: true
+bev_obs: false
+norm_obs: true
+disable_classic_obs: false
+lidar_obs: false
+
+# Environment limits
+max_controlled_agents: ${max_cont_agents}
+num_worlds: 1
+# max_num_agents_in_scene: 128
+# max_num_rg_points: 16384
+# roadgraph_top_k: 64
+# episode_len: 91
+# num_lidar_samples: 64
+# agent_size_scale: 1.0
+
+
+# Reward settings
+reward_type: "sparse_on_goal_achieved"  # Options: sparse_on_goal_achieved, weighted_combination, distance_to_logs, distance_to_vdb_trajs, reward_conditioned
+collision_weight: 0.0
+goal_achieved_weight: 1.0
+off_road_weight: 0.0
+dist_to_goal_threshold: 2.0
+
+# Reward conditioning bounds (for reward_conditioned type)
+condition_mode: "random"  # Options: random, fixed, preset
+collision_weight_lb: -1.0
+collision_weight_ub: 0.0
+goal_achieved_weight_lb: 1.0
+goal_achieved_weight_ub: 2.0
+off_road_weight_lb: -1.0
+off_road_weight_ub: 0.0
+
+# Road observation settings
+road_obs_algorithm: "linear"
+obs_radius: 50.0
+polyline_reduction_threshold: 0.1
+
+# Dynamics model
+dynamics_model: "classic"  # Options: classic, bicycle, delta_local, state
+
+# Action spaces - Classic/Bicycle model
+steer_actions: [-3.14, -2.61, -2.09, -1.57, -1.05, -0.52, 0.0, 0.52, 1.05, 1.57, 2.09, 2.61, 3.14]
+accel_actions: [-4.0, -2.67, -1.33, 0.0, 1.33, 2.67, 4.0]
+head_tilt_actions: [0]
+
+# Action spaces - Delta Local model  
+dx: [-2.0, -1.8, -1.6, -1.4, -1.2, -1.0, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
+dy: [-2.0, -1.8, -1.6, -1.4, -1.2, -1.0, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]  
+dyaw: [-3.14, -2.8, -2.46, -2.12, -1.78, -1.44, -1.1, -0.76, -0.42, -0.08, 0.26, 0.6, 0.94, 1.28, 1.62, 1.96, 2.3, 2.64, 2.98, 3.14]
+
+# Action spaces - State model
+x: [-100.0, -77.78, -55.56, -33.33, -11.11, 11.11, 33.33, 55.56, 77.78, 100.0]
+y: [-100.0, -77.78, -55.56, -33.33, -11.11, 11.11, 33.33, 55.56, 77.78, 100.0]
+yaw: [-3.14, -2.44, -1.75, -1.05, -0.35, 0.35, 1.05, 1.75, 2.44, 3.14]
+vx: [-10.0, -7.78, -5.56, -3.33, -1.11, 1.11, 3.33, 5.56, 7.78, 10.0]
+vy: [-10.0, -7.78, -5.56, -3.33, -1.11, 1.11, 3.33, 5.56, 7.78, 10.0]
+
+# Collision and scene settings
+collision_behavior: "remove"  # Options: remove, stop, ignore  
+remove_non_vehicles: true
+init_steps: 0
+init_mode: "all_non_trivial"  # Options: all_non_trivial, all_objects, all_valid
+
+# Integration settings
+use_vbd: false
+vbd_model_path: null
+vbd_trajectory_weight: 0.01
+vbd_in_obs: false
+smart_pkl_root: null
+use_smart_reward: false
+smart_model_path: null 

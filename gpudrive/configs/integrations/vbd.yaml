@@ -1,0 +1,5 @@
+# @package integrations.vbd
+model_path: "/workspace/gpudrive/models/vbd/vbd_model.ckpt"
+trajectory_weight: 0.01
+in_obs: false
+min_init_steps: 10 

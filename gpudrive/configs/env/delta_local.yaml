@@ -1,0 +1,6 @@
+# @package env
+defaults:
+  - classic
+
+dynamics_model: "delta_local"
+init_steps: 0 

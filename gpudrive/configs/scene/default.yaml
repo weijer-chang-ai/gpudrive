@@ -1,0 +1,10 @@
+# @package scene
+_target_: gpudrive.env.config.SceneConfig
+
+batch_size: ${data.batch_size}
+dataset_size: ${data.dataset_size}
+path: ${data.root}
+num_scenes: null
+discipline: "PAD_N"  # Options: FIRST_N, RANDOM_N, PAD_N, EXACT_N, K_UNIQUE_N
+k_unique_scenes: null
+seed: ${seed} 

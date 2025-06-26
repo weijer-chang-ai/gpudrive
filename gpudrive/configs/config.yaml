@@ -1,0 +1,34 @@
+# @package _global_
+defaults:
+  - env: classic
+  - render: matplotlib  
+  - scene: default
+  - integrations: none  # No integrations by default
+  # Uncomment to enable integrations:
+  - integrations/smart  # Enable SMART
+  # - integrations/vbd    # Enable VBD
+  - _self_
+
+# Global settings
+device: cuda
+backend: torch
+max_cont_agents: 64
+seed: 42
+
+# Data settings  
+data:
+  root: "/workspace/data/gpu_drive/validation"
+  batch_size: 2
+  dataset_size: 100
+  sample_with_replacement: true
+  shuffle: false
+
+# Training settings
+training:
+  num_episodes: 1000
+  save_frequency: 100
+
+# Hydra settings
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S} 

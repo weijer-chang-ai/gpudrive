@@ -1,0 +1,11 @@
+# @package render
+_target_: gpudrive.env.config.RenderConfig
+
+render_mode: "matplotlib"
+view_option: null
+resolution: [1024, 1024]
+draw_expert_trajectories: false
+draw_only_controllable_veh: false
+obj_idx_font_size: 9
+render_3d: false
+vehicle_height: 0.06 

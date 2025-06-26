@@ -1,0 +1,17 @@
+# @package _global_
+# Example: Enable both SMART and VBD integrations
+defaults:
+  - ../base_config
+  - ../integrations/smart: smart
+  - ../integrations/vbd: vbd
+  
+# Override settings when using both integrations
+env:
+  dynamics_model: "delta_local"  # VBD works better with delta_local
+  reward_type: "weighted_combination"  # Better for SMART rewards
+  init_steps: 10  # VBD needs some initialization steps
+
+# You can also override individual integration settings
+integrations:
+  smart:
+    weight: 0.2  # Increase SMART reward weight when using with VBD 

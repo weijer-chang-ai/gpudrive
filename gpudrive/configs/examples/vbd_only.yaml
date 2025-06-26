@@ -1,0 +1,10 @@
+# @package _global_
+# Example: Enable VBD integration only
+defaults:
+  - ../base_config
+  - ../integrations/vbd: vbd
+  
+# Override any settings specific to VBD
+env:
+  dynamics_model: "delta_local"  # VBD works better with delta_local
+  init_steps: 10  # VBD needs some initialization steps 

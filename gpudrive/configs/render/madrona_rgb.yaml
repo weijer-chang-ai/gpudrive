@@ -1,0 +1,6 @@
+# @package render
+defaults:
+  - matplotlib
+
+render_mode: "madrona_rgb"
+view_option: "top_down" 
