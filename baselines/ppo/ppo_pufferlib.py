@@ -176,7 +176,7 @@ def run(
     vbd_in_obs: Annotated[Optional[bool], typer.Option(help="Include VBD predictions in the observation")] = False,
     init_steps: Annotated[Optional[int], typer.Option(help="Environment warmup steps")] = 0,
     # Train options
-    seed: Annotated[Optional[int], typer.Option(help="The seed for training")] = None,
+    seed: Annotated[Optional[int], typer.Option(help="The seed for training")] = 42,
     learning_rate: Annotated[Optional[float], typer.Option(help="The learning rate for training")] = None,
     anneal_lr: Annotated[Optional[int], typer.Option(help="Whether to anneal the learning rate over time; 0 or 1")] = None,
     resample_scenes: Annotated[Optional[int], typer.Option(help="Whether to resample scenes during training; 0 or 1")] = None,
@@ -201,7 +201,7 @@ def run(
     # Load default configs
     config = load_config(config_path)
 
-    # Override configs with command-line arguments
+    # # Override configs with command-line arguments
     env_config = {
         "num_worlds": num_worlds,
         "k_unique_scenes": k_unique_scenes,
@@ -281,7 +281,7 @@ def run(
     )  # Default to 'cpu' if not set
     if torch.cuda.is_available():
         config["train"]["device"] = "cuda"  # Set to 'cuda' if available
-
+    # config["train"]["device"] = "cpu"
     # Make dataloader
     train_loader = SceneDataLoader(
         root=config.data_dir,

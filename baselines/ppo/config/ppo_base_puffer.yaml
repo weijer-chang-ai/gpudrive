@@ -2,9 +2,10 @@ mode: "train"
 use_rnn: false
 eval_model_path: null
 baseline: false
-data_dir: data/processed/training
+data_dir: /workspace/data/gpu_drive/training
 continue_training: false
 model_cpt: null
+
 
 environment: # Overrides default environment configs (see pygpudrive/env/config.py)
   name: "gpudrive"
@@ -37,7 +38,7 @@ environment: # Overrides default environment configs (see pygpudrive/env/config.
   vbd_in_obs: false
 
 wandb:
-  entity: ""
+  entity: "weijer-chang-ai"
   project: "gpudrive"
   group: "test"
   mode: "online" # Options: online, offline, disabled
@@ -62,22 +63,24 @@ train:
   # # # PPO # # #
   torch_deterministic: false
   total_timesteps: 1_000_000_000
-  batch_size: 131_072
-  minibatch_size: 8192
+  batch_size: 131_072 #524288 #131_072
+  minibatch_size: 8192 #16384 #8192
   learning_rate: 3e-4
   anneal_lr: false
   gamma: 0.99
   gae_lambda: 0.95
-  update_epochs: 4
+  update_epochs: 2
   norm_adv: true
   clip_coef: 0.2
   clip_vloss: false
   vf_clip_coef: 0.2
   ent_coef: 0.0001
-  vf_coef: 0.3
+  vf_coef: 0.5
   max_grad_norm: 0.5
   target_kl: null
   log_window: 1000
+  reference_loss_weight: 0.1
+  use_reference_loss: false
 
   # # # Network # # #
   network:

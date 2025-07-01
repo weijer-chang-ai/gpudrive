@@ -168,6 +168,10 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
 
         # Initialize SMART model and preprocessing pipeline
         self._initialize_smart()
+        ## initialkize the log_probs buffer
+
+        # SMART reference distribution settings
+        self.smart_batch_size = 64  # Default batch size for SMART processing
 
     def _load_smart_pickle_data_for_batch(self, data_batch):
         """Load *.pkl files into a list for the current batch."""
@@ -618,6 +622,9 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         # (i.e. a cyclist or pedestrian)
         collided = info_tensor[:, :, 1:3].to(torch.float).sum(axis=2)
         goal_achieved = info_tensor[:, :, 3].to(torch.float)
+
+
+        ## when timestep is final, evaluate smart reward, we evaluate here, and asign to per step
 
         if self.config.reward_type == "sparse_on_goal_achieved":
             return self.sim.reward_tensor().to_torch().clone().squeeze(dim=2)
@@ -1601,6 +1608,65 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         if not hetero_list:
             return None
         return GeoBatch.from_data_list(hetero_list).to(self.device)
+
+    def compute_reference_distribution(self, sorted_actions):
+        """
+        Compute reference log probabilities using SMART model given executed actions.
+        
+        Args:
+            sorted_actions: Tensor of shape (batch_size x action_dim x timestep) containing 
+                           actions sorted by (world_idx, agent_idx, timestep)
+                           
+        Returns:
+            reference_log_probs: Tensor of shape (batch_size,) containing log probabilities
+                                from the SMART reference distribution
+        """
+        if not self.use_smart_reward or self.smart_model is None:
+            # Return dummy log probs if SMART not available
+            return torch.zeros((sorted_actions.shape[0],self.action_space.n), device=self.device)
+        
+        batch_size, num_agents, num_timeseps = self.num_worlds, self.max_agent_count, self.config.episode_len
+        sorted_actions = sorted_actions.reshape(batch_size, num_agents, num_timeseps)
+        # Process actions in batches suitable for SMART
+        reference_log_probs = torch.zeros(batch_size, device=self.device)
+        
+        # Process in batches
+        for batch_start in range(0, batch_size, self.smart_batch_size):
+            batch_end = min(batch_start + self.smart_batch_size, batch_size)
+            batch_actions = sorted_actions[batch_start:batch_end]  # (smart_batch_size, action_dim)
+            
+            # Compute reference log probabilities for this batch
+            batch_log_probs = self._compute_smart_reference_batch(batch_actions)
+            
+            # Store results
+            reference_log_probs[batch_start:batch_end] = batch_log_probs
+        
+        return reference_log_probs
+
+    def _compute_smart_reference_batch(self, batch_actions):
+        """
+        Compute reference log probabilities for a batch of actions using SMART.
+        
+        Args:
+            batch_actions: Tensor of shape (batch_size, action_dim)
+                          
+        Returns:
+            batch_log_probs: Tensor of shape (batch_size,)
+        """
+        batch_size, action_dim = batch_actions.shape
+        
+        # TODO: Implement actual SMART reference distribution computation
+        # This should:
+        # 1. Get current state/observation context for these actions
+        # 2. Pass batch_actions and context to SMART model  
+        # 3. Get log probabilities of actions under SMART distribution
+        # 4. Return log probabilities for each action
+        
+        # Example structure for SMART integration:
+
+        
+        # Dummy implementation for now
+        return torch.zeros(batch_actions.shape[0], device=self.device)
 
 if __name__ == "__main__":
 

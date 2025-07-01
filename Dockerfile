@@ -35,6 +35,11 @@ RUN chown -R ${USERNAME}:${USERNAME} /opt/conda/envs/gpudrive
 ENV PATH /opt/conda/envs/gpudrive/bin:$PATH
 ENV CONDA_DEFAULT_ENV gpudrive
 ENV CONDA_PREFIX /opt/conda/envs/gpudrive
+
+# Configure Wandb for custom server
+ENV WANDB_API_KEY=your_custom_server_api_key
+ENV WANDB_BASE_URL=https://appliedintuition.wandb.io
+
 # Setup working directory
 WORKDIR /workspace
 # Create mount point for local gpudrive repository
@@ -75,7 +80,7 @@ RUN echo '#!/bin/bash\n\
     # Install GPUDrive and dependencies\n\
     echo "Installing GPUDrive..."\n\
     /opt/conda/envs/gpudrive/bin/pip install --no-cache-dir -e .\n\
-    /opt/conda/envs/gpudrive/bin/pip install --no-cache-dir pufferlib>=2.0.6 nvidia-cuda-runtime-cu12==12.4.127 jupyter>=1.1.1 jupyterhub>=5.3.0 '\''numpy<2.0'\''\n\
+    /opt/conda/envs/gpudrive/bin/pip install --no-cache-dir pufferlib==2.0.6 nvidia-cuda-runtime-cu12==12.4.127 jupyter>=1.1.1 jupyterhub>=5.3.0 '\''numpy<2.0'\''\n\
     \n\
     # Install SMART dependencies\n\
     echo "Installing SMART dependencies..."\n\

@@ -58,6 +58,14 @@ def create(config, vecenv, policy, optimizer=None, wandb=None):
 
     lstm = policy.lstm if hasattr(policy, "lstm") else None
 
+    # Get action dimension for reference distribution storage
+    if hasattr(vecenv.single_action_space, 'n'):
+        action_dim = vecenv.single_action_space.n  # Discrete action space
+    elif hasattr(vecenv.single_action_space, 'shape'):
+        action_dim = vecenv.single_action_space.shape[0]  # Continuous action space
+    else:
+        action_dim = None
+
     # Rollout buffer
     experience = Experience(
         config.batch_size,
@@ -70,6 +78,9 @@ def create(config, vecenv, policy, optimizer=None, wandb=None):
         config.device,
         lstm,
         total_agents,
+        controlled_agent_mask=vecenv.controlled_agent_mask,
+        use_reference_loss=config.use_reference_loss,
+        action_dim=action_dim,  # NEW: Pass action dimension
     )
 
     uncompiled_policy = policy
@@ -115,6 +126,7 @@ def evaluate(data):
     ):
         print(f"Resampling scenarios at global step {data.global_step}")
         data.vecenv.resample_scenario_batch()
+        data.experience.update_controlled_agent_mask(data.vecenv.controlled_agent_mask)
         data.resample_buffer = 0
 
     data.vecenv.clear_render_storage()
@@ -157,11 +169,11 @@ def evaluate(data):
             if lstm_h is not None:
                 h = lstm_h[:, env_id]
                 c = lstm_c[:, env_id]
-                actions, logprob, _, value, (h, c) = policy(obs_device, (h, c))
+                actions, logprob, _, value, _, (h, c) = policy(obs_device, (h, c))
                 lstm_h[:, env_id] = h
                 lstm_c[:, env_id] = c
             else:
-                actions, logprob, _, value = policy(obs_device)
+                actions, logprob, _, value, _ = policy(obs_device)
 
             if config.device == "cuda":
                 torch.cuda.synchronize()
@@ -181,7 +193,7 @@ def evaluate(data):
 
             #     # Get terminal (truncated) observation value
             #     with torch.no_grad():
-            #         _, _, _, terminal_value = policy(terminal_obs)
+            #         _, _, _, terminal_value, _ = policy(terminal_obs)
 
             #     # Add discounted value to reward
             #     reward[done_but_truncated] += config.gamma * terminal_value.squeeze(-1)
@@ -202,6 +214,8 @@ def evaluate(data):
             for i in info:
                 for k, v in pufferlib.utils.unroll_nested_dict(i):
                     data.infos[k].append(v)
+
+        # Reference distribution computation moved to train() function
 
     with profile.eval_misc:
         data.stats = {}
@@ -242,6 +256,19 @@ def train(data):
         advantages_np = compute_gae(
             dones_np, values_np, rewards_np, config.gamma, config.gae_lambda
         )
+        
+        # Compute reference distributions using executed actions
+        if experience.use_reference_loss:
+            # Extract executed actions in sorted order
+            sorted_actions = experience.actions[idxs]  # Shape: (batch_size,)
+            
+            # Get reference log probabilities from SMART model
+            # Environment returns full distribution: (batch_size, action_dim)
+            reference_log_probs = data.vecenv.env.compute_reference_distribution(sorted_actions)
+            
+            # Store FULL reference distribution in experience buffer (2D)
+            experience.reference_log_probs_np[:len(idxs)] = reference_log_probs.cpu().numpy()
+        
         experience.flatten_batch(advantages_np)
 
     # Optimizing the policy and value network
@@ -268,7 +295,7 @@ def train(data):
                         lstm_state[1].detach(),
                     )
                 else:
-                    _, newlogprob, entropy, newvalue = data.policy(
+                    _, newlogprob, entropy, newvalue, new_logits = data.policy(
                         obs.reshape(
                             -1, *data.vecenv.single_observation_space.shape
                         ),
@@ -317,10 +344,47 @@ def train(data):
                     v_loss = 0.5 * ((newvalue - ret) ** 2).mean()
 
                 entropy_loss = entropy.mean()
+                reference_loss = torch.tensor(0.0, device=config.device)
+                if experience.use_reference_loss:
+                    ref_log_probs = experience.b_reference_log_probs[mb]
+
+                    logp_new  = torch.log_softmax(new_logits, dim=-1)
+                    logp_old  = torch.log_softmax(ref_log_probs, dim=-1)
+                    p_new     = logp_new.exp()
+                    analytic_kl = (p_new * (logp_new - logp_old)).sum(-1).mean()
+                    reference_loss = analytic_kl        
+                    # ref_analytic_kl = (ref_log_probs_exp * (ref_log_probs - new_logits)).mean()
+
+                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    # ref_old_approx_kl = (-ref_logratio).mean()
+                    # ref_approx_kl = ((ref_ratio - 1) - ref_logratio).mean()
+
+                    # Get reference log probabilities for current minibatch
+                    #TODO: design how to caluclate it 
+                    # KL divergence: D_KL(policy || reference) = sum(p * log(p/q))
+                    # = sum(policy_log_probs - reference_log_probs) * policy_probs
+                    # Simplified: just penalize deviation from reference
+                    # # Get full reference distribution for current minibatch
+                    # ref_log_probs_full = experience.b_reference_log_probs[mb]  # Shape: (minibatch_size, action_dim)
+                    
+                    # # Now you have the full reference distribution available for sophisticated loss calculations
+                    # # Example: You could compute KL divergence, extract specific actions, etc.
+                    
+                    # # Simple example - extract log probs for executed actions:
+                    # atn_flat = atn.flatten()  # Shape: (minibatch_size,)
+                    # ref_log_probs = ref_log_probs_full.gather(1, atn_flat.unsqueeze(1)).squeeze(1)
+                    # reference_loss = -ref_log_probs.mean()  # Maximize reference likelihood
+                    
+                    # # Or compute full KL divergence with current policy distribution:
+                    # # current_policy_logits = newlogprob  # Get full policy distribution
+                    # # kl_loss = F.kl_div(current_policy_logits, ref_log_probs_full.exp(), reduction='batchmean')
+                    # # reference_loss = kl_loss
+
                 loss = (
                     pg_loss
                     - config.ent_coef * entropy_loss
                     + v_loss * config.vf_coef
+                    + reference_loss * config.reference_loss_weight
                 )
 
             with profile.learn:
@@ -340,6 +404,8 @@ def train(data):
                 losses.old_approx_kl += old_approx_kl.item() / num_update_iters
                 losses.approx_kl += approx_kl.item() / num_update_iters
                 losses.clipfrac += clipfrac.item() / num_update_iters
+                if experience.use_reference_loss:
+                    losses.reference_loss += reference_loss.item() / num_update_iters
 
         if config.target_kl is not None:
             if approx_kl > config.target_kl:
@@ -524,6 +590,7 @@ def make_losses():
         approx_kl=0,
         clipfrac=0,
         explained_variance=0,
+        reference_loss=0,
     )
 
 
@@ -542,6 +609,9 @@ class Experience:
         device="cuda",
         lstm=None,
         lstm_total_agents=0,
+        controlled_agent_mask=None,
+        use_reference_loss=False,  # NEW: Enable reference distribution loss
+        action_dim=None,  # NEW: Add action dimension parameter
     ):
         if minibatch_size is None:
             minibatch_size = batch_size
@@ -563,6 +633,15 @@ class Experience:
         self.dones = torch.zeros(batch_size, pin_memory=pin)
         self.truncateds = torch.zeros(batch_size, pin_memory=pin)
         self.values = torch.zeros(batch_size, pin_memory=pin)
+        
+        # NEW: Storage for reference distribution loss (2D: batch_size x action_dim)
+        self.use_reference_loss = use_reference_loss
+        if use_reference_loss:
+            if action_dim is None:
+                raise ValueError("action_dim must be provided when use_reference_loss=True")
+            # Store full reference distribution: (batch_size, action_dim)
+            self.reference_log_probs = torch.zeros(batch_size, action_dim, pin_memory=pin)
+            self.reference_log_probs_np = np.asarray(self.reference_log_probs)
 
         # self.obs_np = np.asarray(self.obs)
         self.actions_np = np.asarray(self.actions)
@@ -599,23 +678,47 @@ class Experience:
         self.ptr = 0
         self.step = 0
 
+        # NEW: Pre-compute mapping from flattened index to (world_idx, agent_idx)
+        if controlled_agent_mask is not None:
+            self.flat_to_world_agent = self._build_flat_to_world_agent_map(
+                controlled_agent_mask
+            )
+        else:
+            self.flat_to_world_agent = None
+
     @property
     def full(self):
         return self.ptr >= self.batch_size
 
     def store(self, obs, value, action, logprob, reward, done, env_id, mask):
-        # Mask learner and Ensure indices do not exceed batch size
+        # Mask learner and ensure indices do not exceed batch size
         ptr = self.ptr
         indices = torch.where(mask)[0].cpu().numpy()[: self.batch_size - ptr]
         end = ptr + len(indices)
 
+        # Store observations and other data
         self.obs[ptr:end] = obs.to(self.obs.device)[indices]
         self.values_np[ptr:end] = value.cpu().numpy()[indices]
         self.actions_np[ptr:end] = action.cpu().numpy()[indices]
         self.logprobs_np[ptr:end] = logprob.cpu().numpy()[indices]
         self.rewards_np[ptr:end] = reward.cpu().numpy()[indices]
         self.dones_np[ptr:end] = done.cpu().numpy()[indices]
-        self.sort_keys.extend([(env_id[i], self.step) for i in indices])
+        
+        # NEW: Vectorized approach to get (world_idx, agent_idx, timestep)
+        if self.flat_to_world_agent is not None:
+            # Batch lookup: shape (len(indices), 2)
+            world_agent_pairs = self.flat_to_world_agent[indices]
+            
+            # Create tuples with timestep
+            world_agent_timestep_tuples = [
+                (world_idx, agent_idx, self.step)
+                for world_idx, agent_idx in world_agent_pairs
+            ]
+            self.sort_keys.extend(world_agent_timestep_tuples)
+        else:
+            # Fallback to old behavior
+            self.sort_keys.extend([(env_id[i], self.step) for i in indices])
+        
         self.ptr = end
         self.step += 1
 
@@ -664,6 +767,88 @@ class Experience:
         self.b_dones = self.b_dones[b_idxs]
         self.b_values = self.b_values[b_flat]
         self.b_returns = self.b_advantages + self.b_values
+        
+        # Add reference log probs flattening here (2D tensor handling)
+        if self.use_reference_loss:
+            self.b_reference_log_probs = self.reference_log_probs.to(self.device, non_blocking=True)
+            # For 2D tensor: select indices for both dimensions (batch, action_dim)
+            self.b_reference_log_probs = self.b_reference_log_probs[b_flat]  # Shape: (num_minibatches, minibatch_size, action_dim)
+
+    def _build_flat_to_world_agent_map(self, controlled_agent_mask):
+        """Pre-compute mapping from flattened controlled agent index to (world_idx, agent_idx)."""
+        # Convert to numpy if needed
+        mask_np = (
+            controlled_agent_mask.cpu().numpy() 
+            if isinstance(controlled_agent_mask, torch.Tensor) 
+            else controlled_agent_mask
+        )
+        
+        # Vectorized approach: find all (world, agent) pairs where mask is True
+        world_idxs, agent_idxs = np.nonzero(mask_np)
+        
+        # Store as 2D array for fast batch lookup: shape (N, 2)
+        # flat_to_world_agent[i] = [world_idx, agent_idx] for flat index i
+        flat_to_world_agent = np.stack([world_idxs, agent_idxs], axis=1)
+        
+        return flat_to_world_agent
+
+    def update_controlled_agent_mask(self, controlled_agent_mask):
+        """Update the mapping when scenarios are resampled."""
+        if controlled_agent_mask is not None:
+            self.flat_to_world_agent = self._build_flat_to_world_agent_map(
+                controlled_agent_mask
+            )
+
+    def compute_reference_log_probs(self, vecenv):
+        """
+        Compute reference log probabilities for stored trajectories.
+        
+        Args:
+            vecenv: The vectorized environment containing reference distribution logic
+        """
+        if not self.use_reference_loss:
+            return
+            
+        # Prepare trajectory data for reference distribution computation
+        trajectory_data = {
+            'actions': self.actions,  # (batch_size, action_dim)
+            'observations': self.obs,  # (batch_size, obs_dim)
+            'world_agent_step': None  # Will be filled below
+        }
+        
+        # Convert sort_keys (which contain world, agent, step info) to tensor
+        if self.flat_to_world_agent is not None:
+            # Extract world, agent, step info from sort_keys before they're cleared
+            world_agent_step_list = []
+            for i in range(self.ptr):
+                if i < len(self.sort_keys):
+                    if len(self.sort_keys[i]) == 3:  # (world, agent, step)
+                        world_agent_step_list.append(self.sort_keys[i])
+                    else:  # Fallback (env_id, step) format
+                        env_id, step = self.sort_keys[i]
+                        # Estimate world and agent from flat index
+                        if i < len(self.flat_to_world_agent):
+                            world_idx, agent_idx = self.flat_to_world_agent[i]
+                            world_agent_step_list.append((world_idx, agent_idx, step))
+                        else:
+                            world_agent_step_list.append((0, 0, step))  # Fallback
+                else:
+                    world_agent_step_list.append((0, 0, 0))  # Fallback
+            
+            trajectory_data['world_agent_step'] = torch.tensor(
+                world_agent_step_list, device=self.device
+            )
+        else:
+            # Fallback: create dummy world_agent_step data
+            trajectory_data['world_agent_step'] = torch.zeros(
+                (self.ptr, 3), dtype=torch.long, device=self.device
+            )
+        
+        # Compute reference distributions using the environment
+        reference_log_probs = vecenv.compute_reference_distribution(trajectory_data)
+        
+        # Store in buffer
+        self.reference_log_probs_np[:self.ptr] = reference_log_probs.cpu().numpy()
 
 
 class Utilization(Thread):
