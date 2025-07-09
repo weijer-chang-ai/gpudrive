@@ -29,6 +29,7 @@ class PufferGPUDrive(PufferEnv):
     def __init__(
         self,
         data_loader=None,
+        env_config=None,
         data_dir=GPU_DRIVE_DATA_DIR,
         loader_batch_size=128,
         loader_dataset_size=3,
@@ -58,6 +59,11 @@ class PufferGPUDrive(PufferEnv):
         use_vbd=False,
         vbd_model_path=None,
         vbd_trajectory_weight=0.1,
+        smart_mode="likelihood",
+        smart_pkl_root=None,
+        smart_cfg=None,
+        use_smart_reward=False,
+        synchronous_reset=False,
         render=False,
         render_3d=True,
         render_interval=50,
@@ -90,6 +96,9 @@ class PufferGPUDrive(PufferEnv):
         self.off_road_weight = off_road_weight
         self.goal_achieved_weight = goal_achieved_weight
 
+        self.synchronous_reset = synchronous_reset
+        self.smart_mode = smart_mode
+
         self.render = render
         self.render_interval = render_interval
         self.render_k_scenarios = render_k_scenarios
@@ -112,32 +121,34 @@ class PufferGPUDrive(PufferEnv):
         os.chdir(working_dir)
 
         # Make env
-        env_config = EnvConfig(
-            ego_state=ego_state,
-            road_map_obs=road_map_obs,
-            partner_obs=partner_obs,
-            reward_type=reward_type,
-            norm_obs=norm_obs,
-            bev_obs=bev_obs,
-            dynamics_model=dynamics_model,
-            collision_behavior=collision_behavior,
-            dist_to_goal_threshold=dist_to_goal_threshold,
-            polyline_reduction_threshold=polyline_reduction_threshold,
-            remove_non_vehicles=remove_non_vehicles,
-            lidar_obs=lidar_obs,
-            disable_classic_obs=True if lidar_obs else False,
-            obs_radius=obs_radius,
-            steer_actions=torch.round(
-                torch.linspace(-torch.pi, torch.pi, action_space_steer_disc),
-                decimals=3,
-            ),
-            accel_actions=torch.round(
-                torch.linspace(-4.0, 4.0, action_space_accel_disc), decimals=3
-            ),
-            use_vbd=use_vbd,
-            vbd_model_path=vbd_model_path,
-            vbd_trajectory_weight=vbd_trajectory_weight,
-        )
+        if env_config is None:
+            env_config = EnvConfig(
+                ego_state=ego_state,
+                road_map_obs=road_map_obs,
+                partner_obs=partner_obs,
+                reward_type=reward_type,
+                norm_obs=norm_obs,
+                bev_obs=bev_obs,
+                dynamics_model=dynamics_model,
+                collision_behavior=collision_behavior,
+                dist_to_goal_threshold=dist_to_goal_threshold,
+                polyline_reduction_threshold=polyline_reduction_threshold,
+                remove_non_vehicles=remove_non_vehicles,
+                lidar_obs=lidar_obs,
+                disable_classic_obs=True if lidar_obs else False,
+                obs_radius=obs_radius,
+                steer_actions=torch.round(
+                    torch.linspace(-torch.pi, torch.pi, action_space_steer_disc),
+                    decimals=3,
+                ),
+                accel_actions=torch.round(
+                    torch.linspace(-4.0, 4.0, action_space_accel_disc), decimals=3
+                ),
+                use_vbd=use_vbd,
+                vbd_model_path=vbd_model_path,
+                vbd_trajectory_weight=vbd_trajectory_weight,
+                smart_mode=smart_mode
+                )
 
         render_config = RenderConfig(
             render_3d=render_3d,
@@ -149,6 +160,9 @@ class PufferGPUDrive(PufferEnv):
             data_loader=data_loader,
             max_cont_agents=max_controlled_agents,
             device=device,
+            smart_pkl_root=smart_pkl_root,
+            smart_cfg=smart_cfg,
+            use_smart_reward=use_smart_reward,
         )
 
         self.obs_size = self.env.observation_space.shape[-1]
@@ -190,6 +204,14 @@ class PufferGPUDrive(PufferEnv):
             file: idx for idx, file in enumerate(self.env.data_loader.dataset)
         }
         self.cumulative_unique_files = set()
+
+        ##
+        # ── NEW ── one counter per world, one timestep per world
+        self.world_scene_id   = torch.zeros(self.num_worlds, dtype=torch.int16,
+                                            device=self.device)    # starts at 0tarts at 0
+        
+        # NEW: Storage for pending smart likelihood computation
+        self.pending_smart_likelihood = None
 
     def close(self):
         """There is no point in closing the env because
@@ -247,6 +269,7 @@ class PufferGPUDrive(PufferEnv):
         # Step the simulator with controlled agents actions
         self.env.step_dynamics(self.actions)
 
+
         # Get rewards, terminal (dones) and info
         reward = self.env.get_rewards(
             collision_weight=self.collision_weight,
@@ -299,24 +322,40 @@ class PufferGPUDrive(PufferEnv):
         # Flatten
         terminal = terminal[self.controlled_agent_mask]
 
+        # Determine reset condition based on mode
+        if self.synchronous_reset:
+            # Synchronous mode: Wait for ALL worlds to be done
+            all_worlds_done = len(done_worlds) == self.num_worlds
+            should_reset = all_worlds_done
+            reset_worlds = list(range(self.num_worlds)) if should_reset else []
+        else:
+            # Asynchronous mode: Reset individual worlds as they finish
+            should_reset = len(done_worlds) > 0
+            reset_worlds = done_worlds_cpu
+
         info_lst = []
-        if len(done_worlds) > 0:
+        if should_reset:
 
             if self.render:
                 for render_env_idx in range(self.render_k_scenarios):
                     self.log_video_to_wandb(render_env_idx, done_worlds)
 
             # Log episode statistics
-            controlled_mask = self.controlled_agent_mask[
-                done_worlds, :
-            ].clone()
+            if self.synchronous_reset:
+                # Synchronous mode: All worlds are done, log stats for all
+                controlled_mask = self.controlled_agent_mask.clone()
+                stats_worlds = slice(None)  # All worlds
+            else:
+                # Asynchronous mode: Only done worlds
+                controlled_mask = self.controlled_agent_mask[done_worlds, :].clone()
+                stats_worlds = done_worlds
 
             num_finished_agents = controlled_mask.sum().item()
 
             # Collision rates are summed across all agents in the episode
             off_road_rate = (
                 torch.where(
-                    self.offroad_in_episode[done_worlds, :][controlled_mask]
+                    self.offroad_in_episode[stats_worlds, :][controlled_mask]
                     > 0,
                     1,
                     0,
@@ -325,7 +364,7 @@ class PufferGPUDrive(PufferEnv):
             )
             collision_rate = (
                 torch.where(
-                    self.collided_in_episode[done_worlds, :][controlled_mask]
+                    self.collided_in_episode[stats_worlds, :][controlled_mask]
                     > 0,
                     1,
                     0,
@@ -334,20 +373,20 @@ class PufferGPUDrive(PufferEnv):
             )
             goal_achieved_rate = (
                 self.env.get_infos()
-                .goal_achieved[done_worlds, :][controlled_mask]
+                .goal_achieved[stats_worlds, :][controlled_mask]
                 .sum()
                 / num_finished_agents
             )
 
-            total_collisions = self.collided_in_episode[done_worlds, :].sum()
-            total_off_road = self.offroad_in_episode[done_worlds, :].sum()
+            total_collisions = self.collided_in_episode[stats_worlds, :].sum()
+            total_off_road = self.offroad_in_episode[stats_worlds, :].sum()
 
-            agent_episode_returns = self.agent_episode_returns[done_worlds, :][
+            agent_episode_returns = self.agent_episode_returns[stats_worlds, :][
                 controlled_mask
             ]
 
             num_truncated = (
-                truncated[done_worlds, :][controlled_mask].sum().item()
+                truncated[stats_worlds, :][controlled_mask].sum().item()
             )
 
             if num_finished_agents > 0:
@@ -360,9 +399,9 @@ class PufferGPUDrive(PufferEnv):
                         "perc_veh_collisions": collision_rate.item(),
                         "total_controlled_agents": self.num_agents,
                         "control_density": self.num_agents / self.controlled_agent_mask.numel(),
-                        "episode_length": self.episode_lengths[done_worlds, :].mean().item(),
+                        "episode_length": self.episode_lengths[stats_worlds, :].mean().item(),
                         "perc_truncated": num_truncated / num_finished_agents,
-                        "num_completed_episodes": len(done_worlds),
+                        "num_completed_episodes": len(reset_worlds),
                         "total_collisions": total_collisions.item(),
                         "total_off_road": total_off_road.item(),
                     }
@@ -372,18 +411,28 @@ class PufferGPUDrive(PufferEnv):
             # Get obs for the last terminal step (before reset)
             self.last_obs = self.env.get_obs(self.controlled_agent_mask)
 
-            # Asynchronously reset the done worlds and empty storage
-            self.env.reset(env_idx_list=done_worlds_cpu)
-            self.episode_returns[done_worlds] = 0
-            self.agent_episode_returns[done_worlds, :] = 0
-            self.episode_lengths[done_worlds, :] = 0
-            # Reset the live agent mask so that the next alive mask will mark
-            # all agents as alive for the next step
-            self.live_agent_mask[done_worlds] = self.controlled_agent_mask[
-                done_worlds
-            ]
-            self.offroad_in_episode[done_worlds, :] = 0
-            self.collided_in_episode[done_worlds, :] = 0
+            ## calculate smart likelihood for complete episodes
+            self.world_scene_id[reset_worlds] += 1
+
+            # NEW: Compute smart likelihood when episodes complete
+            if self.smart_mode == "likelihood":
+                self.pending_smart_likelihood = self.env._compute_smart_episode_likelihood()
+
+            
+            # Reset the specified worlds and empty storage
+            self.env.reset(env_idx_list=reset_worlds)
+
+            ##reset the world state accumulation
+            # self.env._reset_world_state_accumulation()
+            
+            # Reset only done worlds' statistics  
+            reset_tensor = torch.tensor(reset_worlds, device=self.device)
+            self.episode_returns[reset_tensor] = 0
+            self.agent_episode_returns[reset_tensor, :] = 0
+            self.episode_lengths[reset_tensor, :] = 0
+            self.live_agent_mask[reset_tensor] = self.controlled_agent_mask[reset_tensor]
+            self.offroad_in_episode[reset_tensor, :] = 0
+            self.collided_in_episode[reset_tensor, :] = 0
 
         # Get the next observations. Note that we do this after resetting
         # the worlds so that we always return a fresh observation
@@ -393,6 +442,7 @@ class PufferGPUDrive(PufferEnv):
         self.rewards = reward_controlled
         self.terminals = terminal
         self.truncations = truncated[self.controlled_agent_mask]
+
 
         return (
             self.observations,
@@ -512,3 +562,16 @@ class PufferGPUDrive(PufferEnv):
                 },
                 step=self.global_step,
             )
+
+    def get_and_clear_pending_smart_likelihood(self):
+        """
+        Get the pending smart likelihood tensor and clear it.
+        Returns None if no tensor is pending.
+        """
+        likelihood = self.pending_smart_likelihood
+        self.pending_smart_likelihood = None
+        return likelihood
+    
+    def recv(self):
+        return (self.observations, self.rewards, self.terminals,
+            self.truncations, self.infos, self.agent_ids, self.world_scene_id, self.episode_lengths, self.masks)

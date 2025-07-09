@@ -33,6 +33,7 @@ from gpudrive.integrations.smart.utils.finetune import set_model_for_finetuning
 # from src.utils.vis_waymo import VisWaymo
 # from src.utils.wosac_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
+# import torch.nn.functional as F
 
 class SMART(LightningModule):
 
@@ -75,10 +76,128 @@ class SMART(LightningModule):
 
         self.training_rollout_sampling = model_config.training_rollout_sampling
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
-    def forward(self, data_batch): #this format, should input a output from gpu_drive and output a distribution
-        tokenized_map, tokenized_agent = self.token_processor(data_batch)
-        pred = self.encoder(tokenized_map, tokenized_agent)
-        return pred
+
+    def likelihood(self, data_batch, world_states, dt = 0.1, replace_t = 11):
+        """
+        Parameters
+        ----------
+        data_batch['agent'].id      (N,)  int64  – agent-ids present in the graph
+        data_batch['agent'].batch   (N,)  int64  – world index 0..W-1 of each node
+        world_states                [W, A, T, F]  – last feature F-1 is the agent-id
+
+        Returns
+        -------
+        like_world   Tensor [W, A, *]   (zeros where agent absent)
+        """
+        dev         = world_states.device
+        W, A, T, F  = world_states.shape                 # F includes agent-id
+
+        # ------------------------------------------------------------------ #
+        # 1.  world-slot lookup table  (agent-id ⇒ slot index within world)
+        # ------------------------------------------------------------------ #
+        agent_slotid = world_states[:, :, 0, -1].long()  # [W, A] – id table (t=0)
+
+        agent        = data_batch['agent']
+        node_id      = agent.id.to(dev).long()           # (N,)
+        node_world   = agent.batch.to(dev).long()        # (N,)
+
+        id_in_world  = agent_slotid[node_world]          # (N, A)
+        match        = id_in_world.eq(node_id[:, None])  # (N, A) bool
+        found        = match.any(1)                      # (N,) which nodes exist
+        slot_idx     = torch.where(
+            found,
+            match.float().argmax(1),                     # 0..A-1 for valid nodes
+            torch.full_like(node_id, -1))                # -1 for missing nodes
+
+        # ------------------------------------------------------------------ #
+        # 2.  create full [N, T, F-1] tensor (zeros by default)
+        # ------------------------------------------------------------------ #
+        node_states = world_states.new_zeros(len(node_id), T, F-1)  # (N, T, F-1)
+
+        if found.any():                                   # copy only real ones
+            v         = torch.nonzero(found, as_tuple=False).squeeze(1)  # (M,)
+            v_world   = node_world[v]
+            v_slot    = slot_idx[v]
+            node_states[v] = world_states[v_world, v_slot, :, :-1]       # (M,T,F-1)
+
+        # ------------------------------------------------------------------ #
+        # 3.  run the encoder – it sees the *full* batch and can mask itself
+        # ------------------------------------------------------------------ #
+        ##deubg
+
+        ### replace data_batch with our rollout
+
+        with torch.no_grad():
+            #TODO how to make this part memory efficient?
+            gt_pos = data_batch["agent"].position.clone()
+            tok_map, tok_agent = self.token_processor(data_batch)
+            results = self.encoder(tok_map, tok_agent)  
+            orgiinal_logits = results["next_token_logits"]
+            original_gt_idx = tok_agent["gt_idx"][:,2:]
+            original_valid = results["next_token_valid"]  # Add this line
+            
+            from gpudrive.integrations.smart.utils.gpudrive_utils import update_rollout_batch
+            update_rollout_batch(data_batch, node_states, dt, replace_t)
+            tok_map, tok_agent = self.token_processor(data_batch)
+            results = self.encoder(tok_map, tok_agent)        # (N, …)
+            
+            ## curreently the world_staes in 10Hz but likelihood 2Hz
+            like_node_dist = results["next_token_logits"] #N, 16, vocab_size,
+            next_token_valid = results["next_token_valid"] #N, 16
+            
+            LARGE_NEG = -1e9
+            # Mask invalid tokens by setting their logits to -inf
+            like_node_dist[~next_token_valid] = LARGE_NEG  # Set invalid positions to -inf
+            
+            ## based on logits obtain the likelihod of the executued index 
+            gt_idx = tok_agent["gt_idx"][:,2:] #N, 16, 2
+            log_p = torch.nn.functional.log_softmax(like_node_dist, dim=2)
+            ## clamp 
+            log_p   = torch.clamp(log_p, min=-20) #clamp the reward
+
+            likelihood_node = log_p.gather(dim=2, index=gt_idx.unsqueeze(-1)).squeeze(-1) #N, 16, 2
+            
+            
+            # Also mask the original logits for fair comparison
+            orgiinal_logits[~original_valid] = LARGE_NEG
+            
+            ##TODO: may need to calculate exploration term
+        
+        if os.getenv("DEBUG", "FALSE") == "TRUE":
+            like_prob = torch.nn.functional.softmax(like_node_dist, dim=2)
+            like_prob_gt = torch.nn.functional.softmax(orgiinal_logits, dim=2)
+            like_prob_gather = like_prob.gather(dim=2, index=gt_idx.unsqueeze(-1)).squeeze(-1)
+            like_prob_gather_original = like_prob_gt.gather(dim=2, index=original_gt_idx.unsqueeze(-1)).squeeze(-1)
+            ## should expand 
+            like_prob_gather = like_prob_gather.repeat(1,5)
+            like_prob_gather_original = like_prob_gather_original.repeat(1,5) #get 80
+            #append 11 to the start of each row
+            like_prob_gather = torch.cat([torch.ones_like(like_prob_gather[:,0:11]), like_prob_gather], dim=1)
+            like_prob_gather_original = torch.cat([torch.ones_like(like_prob_gather_original[:,0:11]), like_prob_gather_original], dim=1)
+            data_batch["agent"].position = gt_pos
+            # viz_scenes(data_batch, node_states, like_prob_gather, like_prob_gather_original)
+            viz_scenes_compare(data_batch, node_states, like_prob_gather, like_prob_gather_original)
+
+
+        T_target   = world_states.size(2) - replace_t                # e.g. 80
+        if likelihood_node.size(1) < T_target:
+            assert T_target % likelihood_node.size(1) == 0, "T_target must be divisible by likelihood_node.size(1)"
+            dup_factor = T_target // likelihood_node.size(1)
+            likelihood_node = likelihood_node.repeat(1, dup_factor) / dup_factor #N, 16, vocab_size
+
+        # ------------------------------------------------------------------ #
+        # 4.  scatter back to padded [W, A, …]   (zeros stay for gaps)
+        # ------------------------------------------------------------------ #
+        like_world = torch.zeros_like(world_states[...,0])
+
+        if found.any():
+            like_world[node_world[found], slot_idx[found],replace_t:] = likelihood_node[found]
+
+
+        return like_world
+
+
+    
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
         if self.training_rollout_sampling.num_k <= 0:
@@ -290,3 +409,242 @@ class SMART(LightningModule):
     def on_test_epoch_end(self):
         if self.global_rank == 0:
             self.wosac_submission.save_sub_file()
+
+import os, matplotlib.pyplot as plt, numpy as np, torch
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+import os
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+
+def plot_colormap_line(ax, xy: np.ndarray, lik: np.ndarray, cmap=plt.cm.plasma, lw=2, linestyle='-'):
+    """
+    Plot a trajectory as a colored line, where each segment's color encodes its likelihood.
+
+    Parameters
+    ----------
+    ax      : matplotlib Axes
+    xy      : (T,2) array of trajectory points
+    lik     : (T,) array of per-step likelihoods in [0,1]
+    cmap    : colormap to use
+    lw      : line width
+    linestyle: style of the line segments
+    """
+    # Build line segments: shape (T-1, 2, 2)
+    segments = np.stack([xy[:-1], xy[1:]], axis=1)
+    # Normalize likelihoods to [0,1]
+    norm = Normalize(vmin=0.0, vmax=1.0)
+    colors = cmap(norm(lik[:-1]))
+    # Create collection
+    lc = LineCollection(segments, colors=colors, linewidths=lw, linestyle=linestyle)
+    ax.add_collection(lc)
+    # Return mappable for colorbar
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array(lik)
+    return sm
+
+
+def viz_scenes(data_batch, node_states=None, likelihood_prob=None, 
+               gt_likelihood_prob=None, save_dir="videos", max_scenes=50):
+    """
+    Write one PNG per scene in `data_batch`, coloring trajectories by per-step likelihood.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    ptr        = data_batch["pt_token"].ptr.cpu()
+    map_traj   = data_batch["map_save"].traj_pos.cpu().numpy()
+    map_xy     = map_traj.reshape(-1, 2)
+    ptr_exp    = ptr * 3
+    W          = ptr.numel() - 1
+    scenes     = range(min(W, max_scenes))
+
+    use_graph = "position" in data_batch["agent"]
+    if use_graph:
+        ag_pos   = data_batch["agent"].position.cpu().numpy()
+        ag_batch = data_batch["agent"].batch.cpu().numpy()
+        ag_id    = data_batch["agent"].id.cpu().numpy()
+
+    use_ns = node_states is not None
+    if use_ns:
+        ns_xy    = node_states.cpu().numpy()[..., :2]
+        ns_batch = data_batch['agent'].batch.cpu().numpy()
+        ns_id    = data_batch['agent'].id.cpu().numpy()
+
+    use_pred = likelihood_prob is not None
+    if use_pred:
+        pred_lik = likelihood_prob.cpu().numpy()
+        if pred_lik.ndim > 2:
+            pred_lik = pred_lik.mean(axis=-1)
+
+    use_gt = gt_likelihood_prob is not None
+    if use_gt:
+        gt_lik = gt_likelihood_prob.cpu().numpy()
+        if gt_lik.ndim > 2:
+            gt_lik = gt_lik.mean(axis=-1)
+
+    for s in scenes:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        # plot map
+        xy = map_xy[ptr_exp[s]:ptr_exp[s+1]]
+        if xy.size:
+            non_zero = ~((xy[:,0]==0)&(xy[:,1]==0))
+            ax.scatter(xy[non_zero,0], xy[non_zero,1], c="lightgray", s=0.5, zorder=1)
+
+        # ground truth trajectories
+        if use_graph:
+            for i, track in enumerate(ag_pos[ag_batch==s]):
+                color_idx = ag_id[ag_batch==s][i] % 20
+                xy_track = track[:, :2]
+                valid = ~(np.all(xy_track==0, axis=1))
+                if valid.any():
+                    if use_gt:
+                        liks = gt_lik[ag_batch==s][i]
+                        sm = plot_colormap_line(ax, xy_track[valid], liks[valid], lw=3, linestyle='-')
+                    else:
+                        ax.plot(xy_track[valid,0], xy_track[valid,1], c=plt.cm.tab20(color_idx), \
+                                lw=3, linestyle='-', alpha=0.7)
+
+        # predicted trajectories
+        if use_ns:
+            for i, traj in enumerate(ns_xy[ns_batch==s]):
+                color_idx = ns_id[ns_batch==s][i] % 20
+                valid = ~(np.all(traj==0, axis=1))
+                if valid.any():
+                    if use_pred:
+                        liks = pred_lik[ns_batch==s][i]
+                        sm_pred = plot_colormap_line(ax, traj[valid], liks[valid], lw=2, linestyle='--')
+                    else:
+                        ax.plot(traj[valid,0], traj[valid,1], c=plt.cm.tab20(color_idx), \
+                                lw=2, linestyle='--', alpha=0.8)
+
+        # colorbar
+        if use_pred or use_gt:
+            sm_final = sm_pred if use_pred else sm
+            cbar = plt.colorbar(sm_final, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label('Step Likelihood', rotation=270, labelpad=20)
+
+        ax.set_aspect('equal')
+        ax.set_title(f"Scene {s}")
+        out = os.path.join(save_dir, f"scene_{s:03d}.png")
+        fig.savefig(out, dpi=120, bbox_inches='tight')
+        plt.close(fig)
+        print(f"✓ saved {out}")
+
+    print(f"Done – wrote {len(list(scenes))} scene images to '{save_dir}'")
+import os
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+
+def plot_colormap_line(ax, xy: np.ndarray, lik: np.ndarray, cmap=plt.cm.plasma, lw=2, linestyle='-'):
+    """
+    Plot a trajectory as a colored line where each segment's color encodes its likelihood.
+    Returns a ScalarMappable for a shared colorbar.
+    """
+    segments = np.stack([xy[:-1], xy[1:]], axis=1)
+    norm = Normalize(vmin=0.0, vmax=1.0)
+    colors = cmap(norm(lik[:-1]))
+    lc = LineCollection(segments, colors=colors, linewidths=lw, linestyle=linestyle)
+    ax.add_collection(lc)
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array(lik)
+    return sm
+
+
+
+
+def viz_scenes_compare(data_batch, node_states=None, likelihood_prob=None,
+                       gt_likelihood_prob=None, save_dir="videos", max_scenes=50):
+    """Visualise each scene with predicted vs. ground‑truth trajectories side by side."""
+    os.makedirs(save_dir, exist_ok=True)
+    ##TODO, should also count non_vehicles to invalid
+
+    ptr       = data_batch["pt_token"].ptr.cpu()
+    map_xy    = data_batch["map_save"].traj_pos.cpu().numpy().reshape(-1, 2)
+    ptr_exp   = ptr * 3
+    scenes    = range(min(ptr.numel() - 1, max_scenes))
+
+    ag_batch  = data_batch['agent'].batch.cpu().numpy()
+    ag_valid  = data_batch['agent']['valid_mask'].cpu().numpy().astype(bool)  # (N_ag, T)
+
+    # predicted
+    use_pred = node_states is not None and likelihood_prob is not None
+    if use_pred:
+        ns_xy   = node_states.cpu().numpy()[..., :2]
+        pred_lik_all = likelihood_prob.cpu().numpy()
+        if pred_lik_all.ndim > 2:
+            pred_lik_all = pred_lik_all.mean(axis=-1)
+
+    # ground truth
+    use_gt = 'position' in data_batch['agent'] and gt_likelihood_prob is not None
+    if use_gt:
+        ag_pos = data_batch['agent'].position.cpu().numpy()[..., :2]
+        gt_lik_all = gt_likelihood_prob.cpu().numpy()
+        if gt_lik_all.ndim > 2:
+            gt_lik_all = gt_lik_all.mean(axis=-1)
+
+    for s in scenes:
+        fig, (ax_pred, ax_gt) = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
+        fig.suptitle(f"Scene {s}")
+
+        # map background
+        xy_map = map_xy[ptr_exp[s]:ptr_exp[s+1]]
+        mask_map = ~((xy_map[:, 0] == 0) & (xy_map[:, 1] == 0))
+        for ax in (ax_pred, ax_gt):
+            if mask_map.any():
+                ax.scatter(xy_map[mask_map, 0], xy_map[mask_map, 1], c='lightgray', s=0.5, zorder=1)
+
+        coords = []
+        # predicted
+        pred_liks_scene = []
+        if use_pred:
+            for idx in np.where(ag_batch == s)[0]:
+                traj, liks, valid = ns_xy[idx], pred_lik_all[idx], ag_valid[idx]
+                mask = valid & ~(np.all(traj == 0, axis=1))
+                if mask.any():
+                    plot_colormap_line(ax_pred, traj[mask], liks[mask], lw=2, linestyle='--')
+                    coords.append(traj[mask]); pred_liks_scene.append(liks[mask])
+            m_pred = np.nanmean(np.concatenate(pred_liks_scene)) if pred_liks_scene else np.nan
+            ax_pred.set_title(f"Predicted\nmean lik {m_pred:.3f}" if pred_liks_scene else "Predicted")
+        else:
+            ax_pred.set_visible(False)
+
+        # ground truth
+        gt_liks_scene = []
+        if use_gt:
+            for idx in np.where(ag_batch == s)[0]:
+                traj, liks, valid = ag_pos[idx], gt_lik_all[idx], ag_valid[idx]
+                mask = valid & ~(np.all(traj == 0, axis=1))
+                if mask.any():
+                    plot_colormap_line(ax_gt, traj[mask], liks[mask], lw=3, linestyle='-')
+                    coords.append(traj[mask]); gt_liks_scene.append(liks[mask])
+            m_gt = np.nanmean(np.concatenate(gt_liks_scene)) if gt_liks_scene else np.nan
+            ax_gt.set_title(f"Ground Truth\nmean lik {m_gt:.3f}" if gt_liks_scene else "Ground Truth")
+        else:
+            ax_gt.set_visible(False)
+
+        # axis limits
+        if coords:
+            pts = np.vstack(coords)
+            xmean, ymean = np.nanmean(pts[:, 0]), np.nanmean(pts[:, 1])
+            xmin, xmax = xmean - 50, xmean + 50
+            ymin, ymax = ymean - 50, ymean + 50
+            for ax in (ax_pred, ax_gt):
+                ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax); ax.set_aspect('equal')
+
+        # shared colorbar
+        sm = ScalarMappable(norm=Normalize(0, 1), cmap=plt.cm.plasma); sm.set_array([])
+        fig.colorbar(sm, ax=(ax_pred, ax_gt), fraction=0.046, pad=0.04).set_label('Step Likelihood', rotation=270, labelpad=20)
+
+        out = os.path.join(save_dir, f'scene_compare_{s:03d}.png')
+        fig.savefig(out, dpi=120, bbox_inches='tight'); plt.close(fig)
+        print(f"✓ saved {out}")
+
+    print(f"Done – wrote {len(list(scenes))} scene comparison figures to '{save_dir}'")

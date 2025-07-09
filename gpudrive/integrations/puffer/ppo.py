@@ -80,6 +80,7 @@ def create(config, vecenv, policy, optimizer=None, wandb=None):
         total_agents,
         controlled_agent_mask=vecenv.controlled_agent_mask,
         use_reference_loss=config.use_reference_loss,
+        use_smart_likelihood=config.use_smart_likelihood,
         action_dim=action_dim,  # NEW: Pass action dimension
     )
 
@@ -149,9 +150,10 @@ def evaluate(data):
                 truncated,
                 info,
                 env_id,
+                scene_idx,
+                timestep,
                 mask,
             ) = data.vecenv.recv()
-            env_id = env_id.tolist()
 
         with profile.eval_misc:
             total_alive = mask.sum().item()
@@ -208,8 +210,13 @@ def evaluate(data):
                 terminal,
                 env_id,
                 mask,
+                scene_idx,
+                timestep,
             )
-
+            ## if lielhood is not None, assign likelihood reward
+            pending_likelihood = data.vecenv.get_and_clear_pending_smart_likelihood()
+            if pending_likelihood is not None:
+                experience.assign_smart_likelihood_to_experiences(pending_likelihood)
             # Add metrics for logging
             for i in info:
                 for k, v in pufferlib.utils.unroll_nested_dict(i):
@@ -252,18 +259,28 @@ def train(data):
         idxs = experience.sort_training_data()
         dones_np = experience.dones_np[idxs]
         values_np = experience.values_np[idxs]
-        rewards_np = experience.rewards_np[idxs]
+        
+        # Store original rewards before modification
+        original_rewards_np = experience.rewards_np[idxs]
+        rewards_np = original_rewards_np.copy()
+        
+        if experience.use_smart_likelihood:
+            likelihood_np = experience.smart_likelihood_np[idxs]
+            rewards_np = rewards_np + config.likelihood_weight * likelihood_np #plus or minus?
+        else:
+            likelihood_np = np.zeros_like(rewards_np)
+
         advantages_np = compute_gae(
             dones_np, values_np, rewards_np, config.gamma, config.gae_lambda
-        )
+        ) #contiguous so each agents,scene advantages can be accumulated until
         
         # Compute reference distributions using executed actions
         if experience.use_reference_loss:
             # Extract executed actions in sorted order
             sorted_actions = experience.actions[idxs]  # Shape: (batch_size,)
-            
-            # Get reference log probabilities from SMART model
-            # Environment returns full distribution: (batch_size, action_dim)
+
+            ##make the cube before we feed to reference distribution, do we want to do it here? Or everytime scene_idx finished
+
             reference_log_probs = data.vecenv.env.compute_reference_distribution(sorted_actions)
             
             # Store FULL reference distribution in experience buffer (2D)
@@ -283,7 +300,7 @@ def train(data):
                 log_probs = experience.b_logprobs[mb]
                 val = experience.b_values[mb]
                 adv = experience.b_advantages[mb]
-                ret = experience.b_returns[mb]
+                ret = experience.b_returns[mb] #add likielihood reward
 
             with profile.train_forward:
                 if experience.lstm_h is not None:
@@ -406,6 +423,10 @@ def train(data):
                 losses.clipfrac += clipfrac.item() / num_update_iters
                 if experience.use_reference_loss:
                     losses.reference_loss += reference_loss.item() / num_update_iters
+                
+                # Track reward components
+                losses.original_rewards += np.mean(original_rewards_np) / num_update_iters
+                losses.likelihood += np.mean(likelihood_np) / num_update_iters
 
         if config.target_kl is not None:
             if approx_kl > config.target_kl:
@@ -591,6 +612,8 @@ def make_losses():
         clipfrac=0,
         explained_variance=0,
         reference_loss=0,
+        original_rewards=0,  # NEW: Track original environment rewards
+        likelihood=0,       # NEW: Track raw likelihood values
     )
 
 
@@ -611,6 +634,7 @@ class Experience:
         lstm_total_agents=0,
         controlled_agent_mask=None,
         use_reference_loss=False,  # NEW: Enable reference distribution loss
+        use_smart_likelihood=False,
         action_dim=None,  # NEW: Add action dimension parameter
     ):
         if minibatch_size is None:
@@ -642,6 +666,11 @@ class Experience:
             # Store full reference distribution: (batch_size, action_dim)
             self.reference_log_probs = torch.zeros(batch_size, action_dim, pin_memory=pin)
             self.reference_log_probs_np = np.asarray(self.reference_log_probs)
+
+        # +++ Add storage for SMART likelihood
+        self.use_smart_likelihood = use_smart_likelihood
+        self.smart_likelihood = torch.zeros(batch_size, pin_memory=pin)
+        self.smart_likelihood_np = np.asarray(self.smart_likelihood)
 
         # self.obs_np = np.asarray(self.obs)
         self.actions_np = np.asarray(self.actions)
@@ -676,6 +705,7 @@ class Experience:
         self.device = device
         self.sort_keys = []
         self.ptr = 0
+        self.smart_ptr = 0
         self.step = 0
 
         # NEW: Pre-compute mapping from flattened index to (world_idx, agent_idx)
@@ -690,7 +720,7 @@ class Experience:
     def full(self):
         return self.ptr >= self.batch_size
 
-    def store(self, obs, value, action, logprob, reward, done, env_id, mask):
+    def store(self, obs, value, action, logprob, reward, done, env_id, mask, scene_idx, timestep):
         # Mask learner and ensure indices do not exceed batch size
         ptr = self.ptr
         indices = torch.where(mask)[0].cpu().numpy()[: self.batch_size - ptr]
@@ -704,17 +734,19 @@ class Experience:
         self.rewards_np[ptr:end] = reward.cpu().numpy()[indices]
         self.dones_np[ptr:end] = done.cpu().numpy()[indices]
         
-        # NEW: Vectorized approach to get (world_idx, agent_idx, timestep)
+        # +++ Initialize likelihood as zeros (will be assigned post-hoc)
+        self.smart_likelihood_np[ptr:end] = 0.0
+        
+        # Store (world, agent, timestep) info for each experience
         if self.flat_to_world_agent is not None:
             # Batch lookup: shape (len(indices), 2)
             world_agent_pairs = self.flat_to_world_agent[indices]
-            
-            # Create tuples with timestep
-            world_agent_timestep_tuples = [
-                (world_idx, agent_idx, self.step)
-                for world_idx, agent_idx in world_agent_pairs
-            ]
-            self.sort_keys.extend(world_agent_timestep_tuples)
+            world_idx   = world_agent_pairs[:, 0]
+            agent_idx   = world_agent_pairs[:, 1]
+            scene_arr   = scene_idx[world_idx].cpu().numpy()                    # (n,)
+            time_arr    = timestep[world_idx, agent_idx].cpu().numpy().astype(np.int16)
+
+            self.sort_keys.extend(zip(scene_arr, world_idx, agent_idx, time_arr))
         else:
             # Fallback to old behavior
             self.sort_keys.extend([(env_id[i], self.step) for i in indices])
@@ -743,6 +775,7 @@ class Experience:
         )
         self.sort_keys = []
         self.ptr = 0
+        self.smart_ptr = 0
         self.step = 0
         return idxs
 
@@ -774,6 +807,10 @@ class Experience:
             # For 2D tensor: select indices for both dimensions (batch, action_dim)
             self.b_reference_log_probs = self.b_reference_log_probs[b_flat]  # Shape: (num_minibatches, minibatch_size, action_dim)
 
+        # +++ Add SMART likelihood flattening
+        self.b_smart_likelihood = self.smart_likelihood.to(self.device, non_blocking=True)
+        self.b_smart_likelihood = self.b_smart_likelihood[b_flat]  # Shape: (num_minibatches, minibatch_size)
+
     def _build_flat_to_world_agent_map(self, controlled_agent_mask):
         """Pre-compute mapping from flattened controlled agent index to (world_idx, agent_idx)."""
         # Convert to numpy if needed
@@ -799,56 +836,44 @@ class Experience:
                 controlled_agent_mask
             )
 
-    def compute_reference_log_probs(self, vecenv):
+    def assign_smart_likelihood_to_experiences(self, L):
         """
-        Compute reference log probabilities for stored trajectories.
-        
-        Args:
-            vecenv: The vectorized environment containing reference distribution logic
+        Fill SMART likelihoods only for the buffer rows that do not have them yet:
+        # will we have problems assinging the likelihood, if we sorted by scene,world,agent,timestep?
+        given worlds,agents, timesteps --> assing the corrdponding likelihood to the agents
+        [smart_ptr : ptr)
         """
-        if not self.use_reference_loss:
+     
+        if L.numel() == 0:
             return
-            
-        # Prepare trajectory data for reference distribution computation
-        trajectory_data = {
-            'actions': self.actions,  # (batch_size, action_dim)
-            'observations': self.obs,  # (batch_size, obs_dim)
-            'world_agent_step': None  # Will be filled below
-        }
-        
-        # Convert sort_keys (which contain world, agent, step info) to tensor
-        if self.flat_to_world_agent is not None:
-            # Extract world, agent, step info from sort_keys before they're cleared
-            world_agent_step_list = []
-            for i in range(self.ptr):
-                if i < len(self.sort_keys):
-                    if len(self.sort_keys[i]) == 3:  # (world, agent, step)
-                        world_agent_step_list.append(self.sort_keys[i])
-                    else:  # Fallback (env_id, step) format
-                        env_id, step = self.sort_keys[i]
-                        # Estimate world and agent from flat index
-                        if i < len(self.flat_to_world_agent):
-                            world_idx, agent_idx = self.flat_to_world_agent[i]
-                            world_agent_step_list.append((world_idx, agent_idx, step))
-                        else:
-                            world_agent_step_list.append((0, 0, step))  # Fallback
-                else:
-                    world_agent_step_list.append((0, 0, 0))  # Fallback
-            
-            trajectory_data['world_agent_step'] = torch.tensor(
-                world_agent_step_list, device=self.device
-            )
-        else:
-            # Fallback: create dummy world_agent_step data
-            trajectory_data['world_agent_step'] = torch.zeros(
-                (self.ptr, 3), dtype=torch.long, device=self.device
-            )
-        
-        # Compute reference distributions using the environment
-        reference_log_probs = vecenv.compute_reference_distribution(trajectory_data)
-        
-        # Store in buffer
-        self.reference_log_probs_np[:self.ptr] = reference_log_probs.cpu().numpy()
+
+        start, end = self.smart_ptr, self.ptr
+        if start >= end:                 # nothing pending
+            return
+
+        # --- 1. extract the pending (world, agent, timestep) triples ----------
+        pending_keys = self.sort_keys[start:end]          # list of tuples
+        triplets = np.asarray([k[1:] for k in pending_keys], dtype=np.int32)   # (N, 3) #we ignore the scene_idx
+        w, a, t = triplets.T                              # each length N
+
+        # --- 2. keep only indices that are valid for L ------------------------
+        W, A, T = L.shape
+        valid = (w >= 0) & (w < W) & (a >= 0) & (a < A) & (t >= 0) & (t < T)
+        if not valid.any():
+            self.smart_ptr = end      # mark as done even if nothing was valid
+            return
+
+        w, a, t = w[valid], a[valid], t[valid]
+        buffer_pos = np.nonzero(valid)[0] + start         # where to write
+
+        # --- 3. vectorised gather, no Python loop -----------------------------
+        flat_idx = (w * (A * T) + a * T + t).astype(np.int64)   # (N_valid,)
+        flat_L   = L.flatten().cpu().numpy()                    # (W*A*T,)
+
+        self.smart_likelihood_np[buffer_pos] = flat_L[flat_idx]
+
+        # --- 4. advance pointer ----------------------------------------------
+        self.smart_ptr = end
 
 
 class Utilization(Thread):

@@ -95,7 +95,7 @@ class EnvConfig:
     remove_non_vehicles: bool = True  # Remove non-vehicle entities from scene
 
     # Initialization steps: Number of steps to take before the episode starts
-    init_steps: int = 0
+    init_steps: int = 10 # cahnge to here if we want to integrate with smart (having histories)
 
     # Reward settings
     reward_type: str = "sparse_on_goal_achieved"
@@ -135,18 +135,31 @@ class EnvConfig:
 
     # Initialization mode
     init_mode: str = (
-        "all_non_trivial"  # Options: all_non_trivial, all_objects, all_valid
+        "all_non_trivial"  # Options: all_non_trivial, all_objects, all_valid , tracks_to_predict
     )
 
     # VBD model settings
     use_vbd: bool = False
-    vbd_model_path: str = None
+    vbd_model_path: Optional[str] = None
     vbd_trajectory_weight: float = 0.01
     vbd_in_obs: bool = False
-    #smart settings
-    smart_pkl_root: str = None
+
+    # SMART settings
+    smart_pkl_root: Optional[str] = None
     use_smart_reward: bool = False
-    smart_model_path: str = None
+    smart_model_path: Optional[str] = None
+    smart_mode: str = "likelihood"
+    
+    def __post_init__(self):
+        """Convert YAML lists to torch tensors on the fly."""
+        tensor_fields = [
+            'steer_actions', 'accel_actions', 'head_tilt_actions',
+            'dx', 'dy', 'dyaw', 'x', 'y', 'yaw', 'vx', 'vy'
+        ]
+        for name in tensor_fields:
+            val = getattr(self, name)
+            if not isinstance(val, torch.Tensor):
+                setattr(self, name, torch.tensor(val, dtype=torch.float32))
     
 
 

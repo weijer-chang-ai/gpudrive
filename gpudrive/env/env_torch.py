@@ -49,7 +49,8 @@ from omegaconf import DictConfig
 def load_smart(model_cfg: DictConfig, device="cuda"):
     """Load SMART model from checkpoint using Lightning's load_from_checkpoint."""
     from gpudrive.integrations.smart.model.smart import SMART
-    
+    if isinstance(model_cfg, str):
+        model_cfg = OmegaConf.load(model_cfg)
     model = SMART.load_from_checkpoint(
         model_cfg.model_ckpt, 
         map_location=torch.device(device),
@@ -95,7 +96,7 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         self.is_smart_data = bool(smart_pkl_root)  # Simple: if pkl_root provided, it's SMART data
         self.smart_pkl_data = []  # List to store pickle data for current batch
         self.smart_cfg = smart_cfg        # +++ add this line
-
+        self.accumulate_world_states = self.config.smart_mode == "likelihood" #likelihood
         # Initialize reward weights tensor if using reward_conditioned
         self.reward_weights_tensor = None
         if (
@@ -130,8 +131,20 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         self.num_valid_controlled_agents_across_worlds = (
             self.cont_agent_mask.sum().item()
         )
-
         self.episode_len = self.config.episode_len
+        if self.accumulate_world_states:
+            self.episode_world_states = torch.zeros(
+                (self.num_worlds, self.max_agent_count, self.episode_len, 4), #x,y,theta
+                device=self.device, dtype=torch.float32
+            )
+            # +++ Store likelihood for each (world, agent, timestep)
+            self.episode_smart_likelihood = torch.zeros(
+                (self.num_worlds, self.max_agent_count, self.episode_len),
+                device=self.device, dtype=torch.float32
+            )
+            self.global_step_counter = 0
+
+      
 
         # Initialize VBD model if used
         self._initialize_vbd()
@@ -210,53 +223,40 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         if loaded_count > 0:
             print(f"✓ Loaded {loaded_count} pickle files for current batch")
     
-    def get_smart_rewards(self, **kwargs):
-        """Get SMART-specific rewards using the preprocessing pipeline."""
-        if not self.use_smart_reward or self.smart_model is None:
-            return self.get_rewards(**kwargs)  # Fall back to standard rewards
 
-        # 1. base env reward
-        base_r = self.get_rewards(**kwargs)
+    def _extract_world_state_features(self):
+        """Extract relevant world state features for SMART computation."""
+        # Get agent states
+        means_xy = (
+            self.sim.world_means_tensor().to_torch()[:, :2].to(self.device)
+        )
+        agent_states = GlobalEgoState.from_tensor(
+            self.sim.absolute_self_observation_tensor(),
+            self.backend, self.device
+        )
 
-        try:
-            # 2. run SMART on current timestep once every call
-            batch_hetero = self._smart_hetero_batch()
-            
-            if batch_hetero is None:
-                # No SMART data available, return base rewards
-                return base_r
-            
-            smart_scores = self.smart_model(batch_hetero)  # (N_agents,) or (B, A)
-            
-            # Reshape smart_scores to match base_r shape: (num_worlds, max_agent_count)
-            if smart_scores.dim() == 1:
-                # If flat tensor, reshape to batch format
-                # This assumes smart_scores are ordered by world then agent
-                smart_scores = smart_scores.view(self.num_worlds, -1)
-            
-            # Ensure smart_scores matches base_r shape
-            if smart_scores.shape != base_r.shape:
-                # Pad or truncate to match base reward shape
-                target_shape = base_r.shape
-                if smart_scores.shape[1] < target_shape[1]:
-                    # Pad with zeros if fewer agents
-                    padding = torch.zeros(
-                        (target_shape[0], target_shape[1] - smart_scores.shape[1]),
-                        device=self.device
-                    )
-                    smart_scores = torch.cat([smart_scores, padding], dim=1)
-                elif smart_scores.shape[1] > target_shape[1]:
-                    # Truncate if more agents
-                    smart_scores = smart_scores[:, :target_shape[1]]
-
-            # 3. fuse (simple weighted sum here – tune as needed)
-            alpha = getattr(self.smart_cfg, 'weight', 0.1)  # Default weight
-            return base_r + alpha * smart_scores
+        # Check for agents at padding position BEFORE restore_mean
+        PADDING_POSITION = -11000
+        padding_mask = (agent_states.pos_x == PADDING_POSITION) & (agent_states.pos_y == PADDING_POSITION)
         
-        except Exception as e:
-            print(f"Warning: SMART reward computation failed: {e}")
-            # Fall back to base rewards on any error
-            return base_r
+        # Restore mean offset
+        agent_states.restore_mean(mean_x=means_xy[:, 0], mean_y=means_xy[:, 1])
+
+        # Create comprehensive invalid mask
+        uncontrolled_mask = ~self.cont_agent_mask
+        invalid_msk = padding_mask | uncontrolled_mask
+
+        # Replace invalid samples with NaN
+        def _mask_nan(t):
+            return torch.where(invalid_msk, torch.nan, t)
+
+        x = _mask_nan(agent_states.pos_x)
+        y = _mask_nan(agent_states.pos_y)
+        theta = _mask_nan(agent_states.rotation_angle)
+
+        # Stack and return
+        world_state = torch.stack([x, y, theta, agent_states.id], dim=-1)
+        return world_state
 
     def _load_smart_model(self, model_path):
         """Load the SMART model from checkpoint."""
@@ -578,6 +578,8 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
                 init_steps=self.init_steps,
                 # render_init=self.render_config.render_init,
             )
+        ## reset the world state accumulation
+        self._reset_world_state_accumulation()
 
         return self.get_obs(mask)
 
@@ -741,9 +743,12 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         if actions is not None:
             self._apply_actions(actions)
         self.sim.step()
-        not_done_worlds = ~self.get_dones().any(
-            dim=1
-        )  # Check if any agent in world is done
+        
+        # +++ Accumulate world state after each step
+        if self.accumulate_world_states:
+            self._accumulate_world_state()
+        
+        not_done_worlds = ~self.get_dones().any(dim=1) # Check if any agent in world is done
         self.world_time_steps[not_done_worlds] += 1
 
     def _apply_actions(self, actions):
@@ -1595,7 +1600,7 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         the model's `forward`/`training_step`, so we only have to (1) wrap the dict
         in `HeteroData`, (2) run WaymoTargetBuilder*, (3) batch.
         """
-        if not (self.use_smart_reward and self.smart_pkl_data):
+        if not self.smart_pkl_data:
             return None
 
         hetero_list = []
@@ -1667,6 +1672,98 @@ class GPUDriveTorchEnv(GPUDriveGymEnv):
         
         # Dummy implementation for now
         return torch.zeros(batch_actions.shape[0], device=self.device)
+
+    def _accumulate_world_state(self):
+        """Accumulate current world state for all environments."""
+        if not self.accumulate_world_states:
+            return
+        
+        # Only accumulate if we haven't exceeded max episode length
+        if self.global_step_counter >= self.episode_len:
+            return
+        
+        # Extract world state features for all worlds
+        world_state = self._extract_world_state_features()  # Shape: (num_worlds, max_agents, 4)
+        
+        
+        # Store states for all worlds at current timestep
+        self.episode_world_states[:, :, self.global_step_counter] = world_state
+        
+
+            
+        # Increment global step counter
+        self.global_step_counter += 1
+
+    def _compute_smart_episode_likelihood(self):
+        """Compute SMART episode likelihood for all completed episodes."""
+        if not self.accumulate_world_states:
+            return None
+        
+        # Shape: (num_worlds, max_agents, actual_steps, 5)
+        # self.episode_world_states
+        #obtain corresponding smart batch
+        smart_batch = self._smart_hetero_batch()
+        #get the likelihood for the batch
+        likelihood = self.smart_model.likelihood(smart_batch, self.episode_world_states)
+        ## this can also be expanded, for exmaple, uysing waymo simagent challenge to give a reward
+        
+        # Compute SMART likelihood for all worlds
+
+        #those unexecutued
+        # likelihood = torch.zeros(self.num_worlds, self.max_agent_count, self.episode_len, device=self.device)
+        return likelihood
+            
+
+
+    def _reset_world_state_accumulation(self):
+        """Reset world state accumulation for all environments."""
+        if not self.accumulate_world_states:
+            return
+        
+        # Reset global step counter
+        self.global_step_counter = 0
+        
+        # Reset all accumulated states
+        self.episode_world_states.zero_()
+        
+        # +++ Reset likelihood tensor
+        self.episode_smart_likelihood.zero_()
+
+def find_far_agents_from_center(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    threshold: float = 5000.0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Identify agents whose (x,y) lies more than `threshold` from their scene mean.
+
+    Args:
+        x: Tensor of shape (W, A), possibly containing NaNs for invalid agents
+        y: Tensor of shape (W, A)
+        threshold: distance cutoff
+
+    Returns:
+        world_idx: LongTensor of shape (N,) — scene indices
+        agent_idx: LongTensor of shape (N,) — agent indices within each scene
+        distances: Tensor of shape (N,) — centered dist = sqrt((x-μx)^2 + (y-μy)^2)
+    """
+    # 1. compute per-world means ignoring NaNs
+    mean_x = torch.nanmean(x, dim=1, keepdim=True)  # (W,1)
+    mean_y = torch.nanmean(y, dim=1, keepdim=True)  # (W,1)
+
+    # 2. center
+    x_cent = x - mean_x  # (W,A)
+    y_cent = y - mean_y  # (W,A)
+
+    # 3. compute distance from scene-mean
+    dist = torch.sqrt(x_cent**2 + y_cent**2)
+
+    # 4. find far-away agents
+    mask = dist > threshold
+    world_idx, agent_idx = mask.nonzero(as_tuple=True)
+    distances = dist[world_idx, agent_idx]
+
+    return world_idx, agent_idx, distances
 
 if __name__ == "__main__":
 
